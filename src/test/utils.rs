@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(unix)]
-use libc;
-use mock_command::*;
+use crate::mock_command::*;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -25,8 +23,8 @@ use std::path::{Path,PathBuf};
 use std::sync::{Arc,Mutex};
 use tempdir::TempDir;
 
-use jobserver::Client;
-use errors::*;
+use crate::jobserver::Client;
+use crate::errors::*;
 
 /// Return a `Vec` with each listed entry converted to an owned `String`.
 macro_rules! stringvec {

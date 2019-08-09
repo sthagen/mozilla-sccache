@@ -1,17 +1,12 @@
-use base64;
-use hyperx;
-use jwt;
-use openssl;
-use reqwest;
+use crate::jwt;
 use sccache::dist::http::{ClientAuthCheck, ClientVisibleMsg};
 use sccache::util::RequestExt;
-use serde_json;
 use std::collections::HashMap;
 use std::result::Result as StdResult;
 use std::sync::Mutex;
 use std::time::{UNIX_EPOCH, Duration, Instant, SystemTime};
 
-use errors::*;
+use crate::errors::*;
 
 // https://auth0.com/docs/jwks
 #[derive(Debug)]
@@ -87,7 +82,7 @@ impl ClientAuthCheck for MozillaCheck {
         self.check_mozilla(token)
             .map_err(|e| {
                 warn!("Mozilla token validation failed: {}", e);
-                ClientVisibleMsg::from_nonsensitive("Failed to validate Mozilla OAuth token".to_owned())
+                ClientVisibleMsg::from_nonsensitive("Failed to validate Mozilla OAuth token, run sccache --dist-auth".to_owned())
             })
     }
 }

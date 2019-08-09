@@ -1,5 +1,4 @@
 language: rust
-cache: cargo
 
 matrix:
   include:
@@ -8,14 +7,14 @@ matrix:
     - os: osx
 
     # rustc version compat
-    - rust: 1.30.0 # oldest supported version, keep in sync with README.md
-    - rust: 1.30.0
+    - rust: 1.31.1 # oldest supported version, keep in sync with README.md
+    - rust: 1.31.1
       env: DIST_SCCACHE=1
     - rust: beta
     - rust: nightly
 
     # deployments
-    - env: DEPLOY=1 TARGET=x86_64-apple-darwin
+    - env: DEPLOY=1 TARGET=x86_64-apple-darwin OPENSSL_STATIC=yes
       script: cargo build --release --target $TARGET --features=all
       os: osx
     - env: DEPLOY=1 TARGET=x86_64-unknown-linux-musl OPENSSL_DIR=$HOME/openssl-musl

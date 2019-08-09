@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use compiler::{Cacheable, ColorMode, Compiler, CompilerArguments, CompileCommand, CompilerHasher, CompilerKind,
+use crate::compiler::{Cacheable, ColorMode, Compiler, CompilerArguments, CompileCommand, CompilerHasher, CompilerKind,
                Compilation, HashResult};
 #[cfg(feature = "dist-client")]
-use compiler::{NoopOutputsRewriter, OutputsRewriter};
-use dist;
+use crate::compiler::{NoopOutputsRewriter, OutputsRewriter};
+use crate::dist;
 #[cfg(feature = "dist-client")]
-use dist::pkg;
+use crate::dist::pkg;
 use futures::Future;
 use futures_cpupool::CpuPool;
-use mock_command::CommandCreatorSync;
+use crate::mock_command::CommandCreatorSync;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -34,9 +34,9 @@ use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
-use util::{HashToDigest, Digest, hash_all};
+use crate::util::{HashToDigest, Digest, hash_all};
 
-use errors::*;
+use crate::errors::*;
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
@@ -92,7 +92,7 @@ pub struct ParsedArguments {
 }
 
 impl ParsedArguments {
-    pub fn output_pretty(&self) -> Cow<str> {
+    pub fn output_pretty(&self) -> Cow<'_, str> {
         self.outputs.get("obj")
             .and_then(|o| o.file_name())
             .map(|s| s.to_string_lossy())
@@ -194,7 +194,7 @@ impl <I> CCompiler<I>
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     fn kind(&self) -> CompilerKind { CompilerKind::C(self.compiler.kind()) }
     #[cfg(feature = "dist-client")]
-    fn get_toolchain_packager(&self) -> Box<pkg::ToolchainPackager> {
+    fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
         Box::new(CToolchainPackager {
             executable: self.executable.clone(),
             kind: self.compiler.kind(),
@@ -202,7 +202,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     }
     fn parse_arguments(&self,
                        arguments: &[OsString],
-                       cwd: &Path) -> CompilerArguments<Box<CompilerHasher<T> + 'static>> {
+                       cwd: &Path) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
         match self.compiler.parse_arguments(arguments, cwd) {
             CompilerArguments::Ok(args) => {
                 CompilerArguments::Ok(Box::new(CCompilerHasher {
@@ -217,7 +217,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         }
     }
 
-    fn box_clone(&self) -> Box<Compiler<T>> {
+    fn box_clone(&self) -> Box<dyn Compiler<T>> {
         Box::new((*self).clone())
     }
 }
@@ -301,12 +301,12 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
         ColorMode::Auto
     }
 
-    fn output_pretty(&self) -> Cow<str>
+    fn output_pretty(&self) -> Cow<'_, str>
     {
         self.parsed_args.output_pretty()
     }
 
-    fn box_clone(&self) -> Box<CompilerHasher<T>>
+    fn box_clone(&self) -> Box<dyn CompilerHasher<T>>
     {
         Box::new((*self).clone())
     }
@@ -321,7 +321,7 @@ impl<I: CCompilerImpl> Compilation for CCompilation<I> {
     }
 
     #[cfg(feature = "dist-client")]
-    fn into_dist_packagers(self: Box<Self>, path_transformer: dist::PathTransformer) -> Result<(Box<pkg::InputsPackager>, Box<pkg::ToolchainPackager>, Box<OutputsRewriter>)> {
+    fn into_dist_packagers(self: Box<Self>, path_transformer: dist::PathTransformer) -> Result<(Box<dyn pkg::InputsPackager>, Box<dyn pkg::ToolchainPackager>, Box<dyn OutputsRewriter>)> {
         let CCompilation { parsed_args, cwd, preprocessed_input, executable, compiler, .. } = *{self};
         trace!("Dist inputs: {:?}", parsed_args.input);
 
@@ -332,7 +332,7 @@ impl<I: CCompilerImpl> Compilation for CCompilation<I> {
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
     }
 
-    fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a Path)> + 'a>
+    fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item=(&'a str, &'a Path)> + 'a>
     {
         Box::new(self.parsed_args.outputs.iter().map(|(k, v)| (*k, &**v)))
     }
@@ -347,9 +347,7 @@ struct CInputsPackager {
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut io::Write) -> Result<dist::PathTransformer> {
-        use tar;
-
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
         let CInputsPackager { input_path, mut path_transformer, preprocessed_input } = *{self};
 
         let input_path = pkg::simplify_path(&input_path)?;

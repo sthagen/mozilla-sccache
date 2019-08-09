@@ -20,28 +20,10 @@ use std::error;
 use std::io;
 use std::process;
 
-use base64;
-use bincode;
 use futures::Future;
 use futures::future;
-#[cfg(feature = "hyper")]
-use hyper;
 #[cfg(feature = "jsonwebtoken")]
-use jwt;
-use lru_disk_cache;
-#[cfg(feature = "memcached")]
-use memcached;
-#[cfg(feature = "openssl")]
-use openssl;
-use serde_json;
-#[cfg(feature = "redis")]
-use redis;
-#[cfg(feature = "reqwest")]
-use reqwest;
-use tempfile;
-use tokio_timer;
-use walkdir;
-use which;
+use crate::jwt;
 
 error_chain! {
     foreign_links {
@@ -68,7 +50,12 @@ error_chain! {
             description("failed to get a successful HTTP status")
             display("didn't get a successful HTTP status, got `{}`", status)
         }
-        ProcessError(output: process::Output)
+        HttpClientError(msg: String) {
+            display("didn't get a successful HTTP status, got `{}`", msg)
+        }
+        ProcessError(output: process::Output) {
+            display("{}", String::from_utf8_lossy(&output.stderr))
+        }
         Which(err: which::Error) {
             display("{}", err)
         }
@@ -81,8 +68,15 @@ impl From<which::Error> for Error {
     }
 }
 
-pub type SFuture<T> = Box<Future<Item = T, Error = Error>>;
-pub type SFutureSend<T> = Box<Future<Item = T, Error = Error> + Send>;
+#[cfg(feature = "gcs")]
+impl From<chrono::ParseError> for Error {
+    fn from(err: chrono::ParseError) -> Self {
+       Error::from(err.to_string())
+    }
+}
+
+pub type SFuture<T> = Box<dyn Future<Item = T, Error = Error>>;
+pub type SFutureSend<T> = Box<dyn Future<Item = T, Error = Error> + Send>;
 
 pub trait FutureChainErr<T> {
     fn chain_err<F, E>(self, callback: F) -> SFuture<T>

@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cache::disk::DiskCache;
-use client::connect_to_server;
-use commands::{do_compile, request_shutdown, request_stats};
-use env_logger;
+use crate::cache::disk::DiskCache;
+use crate::client::connect_to_server;
+use crate::commands::{do_compile, request_shutdown, request_stats};
 use futures::sync::oneshot::{self, Sender};
 use futures_cpupool::CpuPool;
-use jobserver::Client;
-use mock_command::*;
-use server::{DistClientContainer, SccacheServer, ServerMessage};
+use crate::jobserver::Client;
+use crate::mock_command::*;
+use crate::server::{DistClientContainer, SccacheServer, ServerMessage};
 use std::fs::File;
 use std::io::{Cursor, Write};
 #[cfg(not(target_os = "macos"))]
@@ -32,7 +31,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::u64;
-use test::utils::*;
+use crate::test::utils::*;
 use tokio::runtime::current_thread::Runtime;
 
 /// Options for running the server in tests.
@@ -200,7 +199,7 @@ fn test_server_unsupported_compiler() {
     );
     match res {
         Ok(_) => panic!("do_compile should have failed!"),
-        Err(e) => assert_eq!("Compiler not supported", e.description()),
+        Err(e) => assert_eq!("Compiler not supported: \"error\"", e.description()),
     }
     // Make sure we ran the mock processes.
     assert_eq!(0, server_creator.lock().unwrap().children.len());

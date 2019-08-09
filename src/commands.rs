@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use atty::{self, Stream};
-use bincode;
+use atty::Stream;
 use byteorder::{BigEndian, ByteOrder};
-use client::{connect_to_server, connect_with_retry, ServerConnection};
-use cmdline::{Command, StatsFormat};
-use compiler::ColorMode;
-use config::Config;
+use crate::client::{connect_to_server, connect_with_retry, ServerConnection};
+use crate::cmdline::{Command, StatsFormat};
+use crate::compiler::ColorMode;
+use crate::config::Config;
 use futures::Future;
-use jobserver::Client;
+use crate::jobserver::Client;
 use log::Level::Trace;
-use mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
-use protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
-use serde_json;
-use server::{self, ServerInfo, ServerStartup};
+use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
+use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
+use crate::server::{self, ServerInfo, DistInfo, ServerStartup};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -39,10 +37,10 @@ use tokio::runtime::current_thread::Runtime;
 use tokio_io::io::read_exact;
 use tokio_io::AsyncRead;
 use tokio_timer::Timeout;
-use util::daemonize;
+use crate::util::daemonize;
 use which::which_in;
 
-use errors::*;
+use crate::errors::*;
 
 /// The default sccache server port.
 pub const DEFAULT_PORT: u16 = 4226;
@@ -77,8 +75,6 @@ fn read_server_startup_status<R: AsyncRead>(
 /// for it to start up.
 #[cfg(not(windows))]
 fn run_server_process() -> Result<ServerStartup> {
-    extern crate tokio_uds;
-
     use futures::Stream;
     use std::time::Duration;
     use tempdir::TempDir;
@@ -151,20 +147,19 @@ fn redirect_error_log() -> Result<()> {
 #[cfg(windows)]
 fn run_server_process() -> Result<ServerStartup> {
     use futures::future;
-    use kernel32;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use std::time::Duration;
     use tokio::reactor::Handle;
-    use tokio::runtime::current_thread::Runtime;
     use tokio_named_pipes::NamedPipe;
     use uuid::Uuid;
     use winapi::shared::minwindef::{DWORD, FALSE, LPVOID, TRUE};
     use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
     use winapi::um::winbase::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
     };
+    use winapi::um::handleapi::CloseHandle;
 
     trace!("run_server_process");
 
@@ -229,7 +224,7 @@ fn run_server_process() -> Result<ServerStartup> {
             ptr::null_mut(),
             ptr::null_mut(),
             FALSE,
-            CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             envp.as_mut_ptr() as LPVOID,
             ptr::null(),
             &mut si,
@@ -237,8 +232,8 @@ fn run_server_process() -> Result<ServerStartup> {
         ) == TRUE
     } {
         unsafe {
-            kernel32::CloseHandle(pi.hProcess);
-            kernel32::CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
         }
     } else {
         return Err(io::Error::last_os_error().into());
@@ -300,6 +295,19 @@ pub fn request_stats(mut conn: ServerConnection) -> Result<ServerInfo> {
         .chain_err(|| "Failed to send data to or receive data from server")?;
     if let Response::Stats(stats) = response {
         Ok(stats)
+    } else {
+        bail!("Unexpected server response!")
+    }
+}
+
+/// Send a `DistStatus` request to the server, and return `DistStatus` if successful.
+pub fn request_dist_status(mut conn: ServerConnection) -> Result<DistInfo> {
+    debug!("request_dist_status");
+    let response = conn
+        .request(Request::DistStatus)
+        .chain_err(|| "Failed to send data to or receive data from server")?;
+    if let Response::DistStatus(info) = response {
+        Ok(info)
     } else {
         bail!("Unexpected server response!")
     }
@@ -368,13 +376,13 @@ fn status_signal(_status: process::ExitStatus) -> Option<i32> {
 /// Return the compiler exit status.
 fn handle_compile_finished(
     response: CompileFinished,
-    stdout: &mut Write,
-    stderr: &mut Write,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<i32> {
     trace!("handle_compile_finished");
     fn write_output(
         stream: Stream,
-        writer: &mut Write,
+        writer: &mut dyn Write,
         data: &[u8],
         color_mode: ColorMode,
     ) -> Result<()> {
@@ -438,8 +446,8 @@ fn handle_compile_response<T>(
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
-    stdout: &mut Write,
-    stderr: &mut Write,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<i32>
 where
     T: CommandCreatorSync,
@@ -468,9 +476,9 @@ where
                 }
             }
         }
-        CompileResponse::UnsupportedCompiler => {
-            debug!("Server sent UnsupportedCompiler");
-            bail!("Compiler not supported");
+        CompileResponse::UnsupportedCompiler(s) => {
+            debug!("Server sent UnsupportedCompiler: {:?}", s);
+            bail!("Compiler not supported: {:?}", s);
         }
         CompileResponse::UnhandledCompile => {
             debug!("Server sent UnhandledCompile");
@@ -513,8 +521,8 @@ pub fn do_compile<T>(
     cwd: &Path,
     path: Option<OsString>,
     env_vars: Vec<(OsString, OsString)>,
-    stdout: &mut Write,
-    stderr: &mut Write,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<i32>
 where
     T: CommandCreatorSync,
@@ -580,8 +588,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         #[cfg(feature = "dist-client")]
         Command::DistAuth => {
-            use config;
-            use dist;
+            use crate::config;
+            use crate::dist;
             use url::Url;
 
             match &config.dist.auth {
@@ -632,9 +640,15 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::DistAuth => bail!(
             "Distributed compilation not compiled in, please rebuild with the dist-client feature"
         ),
+        Command::DistStatus => {
+            trace!("Command::DistStatus");
+            let srv = connect_or_start_server(get_port())?;
+            let status = request_dist_status(srv).chain_err(|| "failed to get dist-status from server")?;
+            serde_json::to_writer(&mut io::stdout(), &status)?;
+        },
         #[cfg(feature = "dist-client")]
         Command::PackageToolchain(executable, out) => {
-            use compiler;
+            use crate::compiler;
             use futures_cpupool::CpuPool;
 
             trace!("Command::PackageToolchain({})", executable.display());

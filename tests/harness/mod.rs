@@ -1,19 +1,3 @@
-extern crate assert_cmd;
-extern crate bincode;
-extern crate env_logger;
-extern crate escargot;
-#[cfg(feature = "dist-server")]
-extern crate nix;
-extern crate predicates;
-#[cfg(feature = "dist-server")]
-extern crate reqwest;
-extern crate sccache;
-extern crate serde;
-extern crate serde_json;
-extern crate uuid;
-#[cfg(feature = "dist-server")]
-extern crate void;
-
 #[cfg(feature = "dist-server")]
 use std::env;
 use std::fs;
@@ -29,19 +13,19 @@ use sccache::config::HTTPUrl;
 use sccache::dist::{self, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 
-use self::assert_cmd::prelude::*;
-use self::escargot::CargoBuild;
+use assert_cmd::prelude::*;
+use escargot::CargoBuild;
 #[cfg(feature = "dist-server")]
-use self::nix::{
+use nix::{
     sys::{
         signal::Signal,
         wait::{WaitPidFlag, WaitStatus},
     },
     unistd::{ForkResult, Pid},
 };
-use self::predicates::prelude::*;
-use self::serde::Serialize;
-use self::uuid::Uuid;
+use predicates::prelude::*;
+use serde::Serialize;
+use uuid::Uuid;
 
 #[cfg(feature = "dist-server")]
 macro_rules! matches {
@@ -291,6 +275,7 @@ impl DistSystem {
             .args(&[
                 "run",
                 "--name", &scheduler_name,
+                "-e", "SCCACHE_NO_DAEMON=1",
                 "-e", "RUST_LOG=sccache=trace",
                 "-e", "RUST_BACKTRACE=1",
                 "-v", &format!("{}:/sccache-dist", self.sccache_dist.to_str().unwrap()),
@@ -310,7 +295,7 @@ impl DistSystem {
         wait_for_http(scheduler_url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(|| {
             let status = self.scheduler_status();
-            if matches!(self.scheduler_status(), SchedulerStatusResult { num_servers: 0 }) { Ok(()) } else { Err(format!("{:?}", status)) }
+            if matches!(self.scheduler_status(), SchedulerStatusResult { num_servers: 0, num_cpus: _ }) { Ok(()) } else { Err(format!("{:?}", status)) }
         }, Duration::from_millis(100), MAX_STARTUP_WAIT);
     }
 
@@ -326,7 +311,7 @@ impl DistSystem {
                 // Important for the bubblewrap builder
                 "--privileged",
                 "--name", &server_name,
-                "-e", "RUST_LOG=sccache=debug",
+                "-e", "RUST_LOG=sccache=trace",
                 "-e", "RUST_BACKTRACE=1",
                 "-v", &format!("{}:/sccache-dist", self.sccache_dist.to_str().unwrap()),
                 "-v", &format!("{}:{}", self.tmpdir.to_str().unwrap(), CONFIGS_CONTAINER_PATH),
@@ -401,7 +386,7 @@ impl DistSystem {
         wait_for_http(url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(|| {
             let status = self.scheduler_status();
-            if matches!(self.scheduler_status(), SchedulerStatusResult { num_servers: 1 }) { Ok(()) } else { Err(format!("{:?}", status)) }
+            if matches!(self.scheduler_status(), SchedulerStatusResult { num_servers: 1, num_cpus: _ }) { Ok(()) } else { Err(format!("{:?}", status)) }
         }, Duration::from_millis(100), MAX_STARTUP_WAIT);
     }
 

@@ -13,8 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use azure::credentials::*;
-use base64;
+use crate::azure::credentials::*;
 use crypto::digest::Digest;
 use crypto::hmac::Hmac;
 use crypto::mac::Mac;
@@ -25,14 +24,12 @@ use hyper::Method;
 use hyper::header::HeaderValue;
 use hyperx::header;
 use url::Url;
-use reqwest;
-use reqwest::async::{Request, Client};
+use reqwest::r#async::{Request, Client};
 use std::fmt;
 use std::str::FromStr;
-use time;
 
-use errors::*;
-use util::HeadersExt;
+use crate::errors::*;
+use crate::util::HeadersExt;
 
 const BLOB_API_VERSION: &str = "2017-04-17";
 
@@ -63,7 +60,7 @@ pub struct BlobContainer {
 }
 
 impl fmt::Display for BlobContainer {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "BlobContainer(url={})", self.url)
     }
 }

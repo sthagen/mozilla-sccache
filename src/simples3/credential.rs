@@ -7,7 +7,7 @@ use directories::UserDirs;
 use futures::future::{self, Shared};
 use futures::{Async, Future, Stream};
 use hyper::client::HttpConnector;
-use hyper::{self, Client, Request};
+use hyper::{Client, Request};
 use hyperx::header::Connection;
 use regex::Regex;
 use serde_json::{from_str, Value};
@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 use tokio_timer::Timeout;
 
-use errors::*;
-use util::RequestExt;
+use crate::errors::*;
+use crate::util::RequestExt;
 
 /// AWS API access credentials, including access key, secret key, token (for IAM profiles), and
 /// expiration timestamp.

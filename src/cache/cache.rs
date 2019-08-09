@@ -13,20 +13,18 @@
 // limitations under the License.
 
 #[cfg(feature = "azure")]
-use cache::azure::AzureBlobCache;
-use cache::disk::DiskCache;
+use crate::cache::azure::AzureBlobCache;
+use crate::cache::disk::DiskCache;
 #[cfg(feature = "gcs")]
-use cache::gcs::{self, GCSCache, GCSCredentialProvider, RWMode};
+use crate::cache::gcs::{self, GCSCache, GCSCredentialProvider, RWMode, ServiceAccountInfo};
 #[cfg(feature = "memcached")]
-use cache::memcached::MemcachedCache;
+use crate::cache::memcached::MemcachedCache;
 #[cfg(feature = "redis")]
-use cache::redis::RedisCache;
+use crate::cache::redis::RedisCache;
 #[cfg(feature = "s3")]
-use cache::s3::S3Cache;
-use config::{self, CacheType, Config};
+use crate::cache::s3::S3Cache;
+use crate::config::{self, CacheType, Config};
 use futures_cpupool::CpuPool;
-#[cfg(feature = "gcs")]
-use serde_json;
 use std::fmt;
 #[cfg(feature = "gcs")]
 use std::fs::File;
@@ -36,7 +34,7 @@ use std::time::Duration;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use errors::*;
+use crate::errors::*;
 
 /// Result of a cache lookup.
 pub enum Cache {
@@ -49,7 +47,7 @@ pub enum Cache {
 }
 
 impl fmt::Debug for Cache {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Cache::Hit(_) => write!(f, "Cache::Hit(...)"),
             Cache::Miss => write!(f, "Cache::Miss"),
@@ -65,7 +63,7 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 
 /// Data stored in the compiler cache.
 pub struct CacheRead {
-    zip: ZipArchive<Box<ReadSeek>>,
+    zip: ZipArchive<Box<dyn ReadSeek>>,
 }
 
 impl CacheRead {
@@ -74,7 +72,7 @@ impl CacheRead {
     where
         R: ReadSeek + 'static,
     {
-        let z = ZipArchive::new(Box::new(reader) as Box<ReadSeek>)
+        let z = ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>)
             .chain_err(|| "Failed to parse cache entry")?;
         Ok(CacheRead { zip: z })
     }
@@ -164,7 +162,7 @@ pub trait Storage {
 }
 
 /// Get a suitable `Storage` implementation from configuration.
-pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<Storage> {
+pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<dyn Storage> {
     for cache_type in config.caches.iter() {
         match *cache_type {
             CacheType::Azure(config::AzureCacheConfig) => {
@@ -181,15 +179,16 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<Storage> {
             CacheType::GCS(config::GCSCacheConfig {
                 ref bucket,
                 ref cred_path,
+                ref url,
                 rw_mode,
             }) => {
                 debug!(
-                    "Trying GCS bucket({}, {:?}, {:?})",
-                    bucket, cred_path, rw_mode
+                    "Trying GCS bucket({}, {:?}, {:?}, {:?})",
+                    bucket, cred_path, url, rw_mode
                 );
                 #[cfg(feature = "gcs")]
                 {
-                    let service_account_key_opt: Option<gcs::ServiceAccountKey> =
+                    let service_account_info_opt: Option<gcs::ServiceAccountInfo> =
                         if let Some(ref cred_path) = *cred_path {
                             // Attempt to read the service account key from file
                             let service_account_key_res: Result<
@@ -210,7 +209,9 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<Storage> {
                                 );
                             }
 
-                            service_account_key_res.ok()
+                            service_account_key_res.ok().map(|account_key| ServiceAccountInfo::AccountKey(account_key))
+                        } else if let Some(ref url) = *url {
+                            Some(ServiceAccountInfo::URL(url.clone()))
                         } else {
                             warn!(
                             "No SCCACHE_GCS_KEY_PATH specified-- no authentication will be used."
@@ -223,8 +224,8 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<Storage> {
                         config::GCSCacheRWMode::ReadWrite => RWMode::ReadWrite,
                     };
 
-                    let gcs_cred_provider = service_account_key_opt
-                        .map(|path| GCSCredentialProvider::new(gcs_read_write_mode, path));
+                    let gcs_cred_provider = service_account_info_opt
+                        .map(|info| GCSCredentialProvider::new(gcs_read_write_mode, info));
 
                     match GCSCache::new(bucket.to_owned(), gcs_cred_provider, gcs_read_write_mode) {
                         Ok(s) => {

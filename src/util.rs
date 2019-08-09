@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bincode;
 use byteorder::{BigEndian, ByteOrder};
 use futures::{future, Future};
 use futures_cpupool::CpuPool;
-use mock_command::{CommandChild, RunCommand};
+use crate::mock_command::{CommandChild, RunCommand};
 use ring::digest::{Context, SHA512};
 use serde::Serialize;
-use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::Hasher;
@@ -30,7 +28,7 @@ use std::process::{self, Stdio};
 use std::time;
 use std::time::Duration;
 
-use errors::*;
+use crate::errors::*;
 
 #[derive(Clone)]
 pub struct Digest {
@@ -50,15 +48,12 @@ impl Digest {
     where
         T: AsRef<Path>,
     {
-        let path = path.as_ref();
-        let f = ftry!(
-            File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path))
-        );
-        Self::reader(f, pool)
+        Self::reader(path.as_ref().to_owned(), pool)
     }
 
-    pub fn reader<R: Read + Send + 'static>(rdr: R, pool: &CpuPool) -> SFuture<String> {
+    pub fn reader(path: PathBuf, pool: &CpuPool) -> SFuture<String> {
         Box::new(pool.spawn_fn(move || -> Result<_> {
+            let rdr = File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
             let mut m = Digest::new();
             let mut reader = BufReader::new(rdr);
             loop {
@@ -92,7 +87,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
     fn hex(byte: u8) -> char {
         match byte {
-            0...9 => (b'0' + byte) as char,
+            0..=9 => (b'0' + byte) as char,
             _ => (b'a' + byte - 10) as char,
         }
     }
@@ -338,9 +333,7 @@ pub use self::http_extension::{HeadersExt, RequestExt};
 
 #[cfg(feature = "hyperx")]
 mod http_extension {
-    use http;
     use http::header::HeaderValue;
-    use hyperx;
     use std::fmt;
 
     pub trait HeadersExt {
@@ -406,7 +399,7 @@ mod http_extension {
     }
 
     #[cfg(feature = "reqwest")]
-    impl RequestExt for ::reqwest::async::RequestBuilder {
+    impl RequestExt for ::reqwest::r#async::RequestBuilder {
         fn set_header<H>(self, header: H) -> Self
         where
             H: hyperx::header::Header + fmt::Display,
@@ -436,7 +429,7 @@ mod http_extension {
 #[cfg(not(windows))]
 pub fn daemonize() -> Result<()> {
     use daemonize::Daemonize;
-    use libc;
+    use std::env;
     use std::mem;
 
     match env::var("SCCACHE_NO_DAEMON") {

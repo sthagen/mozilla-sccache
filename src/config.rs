@@ -15,11 +15,9 @@
 use directories::ProjectDirs;
 use regex::Regex;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
-use reqwest;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 use serde::ser::{Serialize, Serializer};
 use serde::de::{Deserialize, DeserializeOwned, Deserializer};
-use serde_json;
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
@@ -28,9 +26,8 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::Mutex;
-use toml;
 
-use errors::*;
+use crate::errors::*;
 
 lazy_static! {
     static ref CACHED_CONFIG_PATH: PathBuf = CachedConfig::file_config_path();
@@ -46,7 +43,7 @@ const MOZILLA_OAUTH_PKCE_CLIENT_ID: &str = "F1VVD6nRTckSVrviMRaOdLBWIk1AvHYo";
 // The sccache audience is an API set up in auth0 for sccache to allow 7 day expiry,
 // the openid scope allows us to query the auth0 /userinfo endpoint which contains
 // group information due to Mozilla rules.
-const MOZILLA_OAUTH_PKCE_AUTH_URL: &str = "https://auth.mozilla.auth0.com/authorize?audience=sccache&scope=openid";
+const MOZILLA_OAUTH_PKCE_AUTH_URL: &str = "https://auth.mozilla.auth0.com/authorize?audience=sccache&scope=openid%20profile";
 const MOZILLA_OAUTH_PKCE_TOKEN_URL: &str = "https://auth.mozilla.auth0.com/oauth/token";
 
 pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
@@ -169,6 +166,7 @@ pub enum GCSCacheRWMode {
 pub struct GCSCacheConfig {
     pub bucket: String,
     pub cred_path: Option<PathBuf>,
+    pub url: Option<String>,
     pub rw_mode: GCSCacheRWMode,
 }
 
@@ -417,8 +415,16 @@ fn config_from_env() -> EnvConfig {
 
     let gcs = env::var("SCCACHE_GCS_BUCKET").ok()
         .map(|bucket| {
+            let url = env::var("SCCACHE_GCS_CREDENTIALS_URL").ok();
             let cred_path = env::var_os("SCCACHE_GCS_KEY_PATH")
                 .map(|p| PathBuf::from(p));
+
+            if url.is_some() && cred_path.is_some() {
+                warn!("Both SCCACHE_GCS_CREDENTIALS_URL and SCCACHE_GCS_KEY_PATH are set");
+                warn!("You should set only one of them!");
+                warn!("SCCACHE_GCS_KEY_PATH will take precedence");
+            }
+
             let rw_mode = match env::var("SCCACHE_GCS_RW_MODE")
                                       .as_ref().map(String::as_str) {
                 Ok("READ_ONLY") => GCSCacheRWMode::ReadOnly,
@@ -434,22 +440,27 @@ fn config_from_env() -> EnvConfig {
                     GCSCacheRWMode::ReadOnly
                 }
             };
-            GCSCacheConfig { bucket, cred_path, rw_mode }
+            GCSCacheConfig { bucket, cred_path, url, rw_mode }
         });
 
 
     let azure = env::var("SCCACHE_AZURE_CONNECTION_STRING").ok()
         .map(|_| AzureCacheConfig);
 
-    let disk = env::var_os("SCCACHE_DIR")
-        .map(|p| PathBuf::from(p))
-        .map(|dir| {
-            let size: u64 = env::var("SCCACHE_CACHE_SIZE")
-                .ok()
-                .and_then(|v| parse_size(&v))
-                .unwrap_or(TEN_GIGS);
-            DiskCacheConfig { dir, size }
-        });
+    let disk_dir = env::var_os("SCCACHE_DIR")
+        .map(PathBuf::from);
+    let disk_sz = env::var("SCCACHE_CACHE_SIZE")
+        .ok()
+        .and_then(|v| parse_size(&v));
+
+    let disk = if disk_dir.is_some() || disk_sz.is_some() {
+        Some(DiskCacheConfig {
+            dir: disk_dir.unwrap_or_else(default_disk_cache_dir),
+            size: disk_sz.unwrap_or_else(default_disk_cache_size),
+        })
+    } else {
+        None
+    };
 
     let cache = CacheConfigs {
         azure,
@@ -531,6 +542,13 @@ impl CachedConfig {
         }
         Ok(CachedConfig(()))
     }
+    pub fn reload() -> Result<Self> {
+        {
+            let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
+            *cached_file_config = None;
+        };
+        Self::load()
+    }
     pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> T {
         let cached_file_config = CACHED_CONFIG.lock().unwrap();
         let cached_file_config = cached_file_config.as_ref().unwrap();
@@ -584,7 +602,7 @@ pub mod scheduler {
     use std::net::SocketAddr;
     use std::path::Path;
 
-    use errors::*;
+    use crate::errors::*;
 
     #[derive(Debug)]
     #[derive(Serialize, Deserialize)]
@@ -636,7 +654,7 @@ pub mod server {
     use std::path::{Path, PathBuf};
     use super::HTTPUrl;
 
-    use errors::*;
+    use crate::errors::*;
 
     const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
     fn default_toolchain_cache_size() -> u64 { TEN_GIGS }
@@ -741,4 +759,24 @@ fn config_overrides() {
             dist: Default::default(),
         }
     );
+}
+
+#[test]
+fn test_gcs_credentials_url() {
+    env::set_var("SCCACHE_GCS_BUCKET", "my-bucket");
+    env::set_var("SCCACHE_GCS_CREDENTIALS_URL", "http://localhost/");
+    env::set_var("SCCACHE_GCS_RW_MODE", "READ_WRITE");
+
+    let env_cfg = config_from_env();
+    match env_cfg.cache.gcs {
+        Some(GCSCacheConfig{ref bucket, cred_path: _, ref url, rw_mode}) => {
+            assert_eq!(bucket, "my-bucket");
+            match url {
+                Some(ref url) => assert_eq!(url, "http://localhost/"),
+                None => panic!("URL can't be none"),
+            };
+            assert_eq!(rw_mode, GCSCacheRWMode::ReadWrite);
+        },
+        None => assert!(false),
+    };
 }

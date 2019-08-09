@@ -5,7 +5,6 @@
 use std::ascii::AsciiExt;
 use std::fmt;
 
-use base64;
 use crypto::digest::Digest;
 use crypto::hmac::Hmac;
 use crypto::mac::Mac;
@@ -14,13 +13,11 @@ use futures::{Future, Stream};
 use hyperx::header;
 use hyper::header::HeaderValue;
 use hyper::Method;
-use reqwest;
-use reqwest::async::{Client, Request};
-use simples3::credential::*;
-use time;
+use reqwest::r#async::{Client, Request};
+use crate::simples3::credential::*;
 
-use errors::*;
-use util::HeadersExt;
+use crate::errors::*;
+use crate::util::HeadersExt;
 
 #[derive(Debug, Copy, Clone)]
 #[allow(dead_code)]
@@ -66,7 +63,7 @@ pub struct Bucket {
 }
 
 impl fmt::Display for Bucket {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Bucket(name={}, base_url={})", self.name, self.base_url)
     }
 }

@@ -15,24 +15,25 @@
 // For tokio_io::codec::length_delimited::Framed;
 #![allow(deprecated)]
 
-use cache::{storage_from_config, Storage};
-use compiler::{
+use crate::cache::{storage_from_config, Storage};
+use crate::compiler::{
     get_compiler_info, CacheControl, CompileResult, Compiler, CompilerKind,
     CompilerArguments, CompilerHasher, DistType, MissType,
 };
 #[cfg(feature = "dist-client")]
-use config;
-use config::Config;
-use dist;
+use crate::config;
+use crate::config::Config;
+use crate::dist;
+use crate::dist::Client as DistClient;
 use filetime::FileTime;
 use futures::sync::mpsc;
 use futures::task::{self, Task};
 use futures::{future, stream, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use futures_cpupool::CpuPool;
-use jobserver::Client;
-use mock_command::{CommandCreatorSync, ProcessCommandCreator};
+use crate::jobserver::Client;
+use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use number_prefix::{binary_prefix, Prefixed, Standalone};
-use protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
+use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
@@ -51,7 +52,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use std::u64;
-use tokio;
 use tokio::runtime::current_thread::Runtime;
 use tokio_io::codec::length_delimited;
 use tokio_io::codec::length_delimited::Framed;
@@ -60,9 +60,9 @@ use tokio_serde_bincode::{ReadBincode, WriteBincode};
 use tokio_service::Service;
 use tokio_tcp::TcpListener;
 use tokio_timer::{Delay, Timeout};
-use util; //::fmt_duration_as_secs;
+use crate::util; //::fmt_duration_as_secs;
 
-use errors::*;
+use crate::errors::*;
 
 /// If the server is idle for this many seconds, shut down.
 const DEFAULT_IDLE_TIMEOUT: u64 = 600;
@@ -116,7 +116,7 @@ fn notify_server_startup(name: &Option<OsString>, status: ServerStartup) -> Resu
         Some(ref s) => s,
         None => return Ok(()),
     };
-    let pipe = try!(OpenOptions::new().write(true).read(true).open(name));
+    let pipe = OpenOptions::new().write(true).read(true).open(name)?;
     notify_server_startup_internal(pipe, status)
 }
 
@@ -152,7 +152,9 @@ struct DistClientConfig {
 #[cfg(feature = "dist-client")]
 enum DistClientState {
     #[cfg(feature = "dist-client")]
-    Some(Arc<dist::Client>),
+    Some(DistClientConfig, Arc<dyn dist::Client>),
+    #[cfg(feature = "dist-client")]
+    FailWithMessage(DistClientConfig, String),
     #[cfg(feature = "dist-client")]
     RetryCreateAt(DistClientConfig, Instant),
     Disabled,
@@ -172,8 +174,16 @@ impl DistClientContainer {
         Self {}
     }
 
-    fn get_client(&self) -> Option<Arc<dist::Client>> {
-        None
+    pub fn reset_state(&self) { }
+
+    pub fn get_status(&self) -> DistInfo {
+        DistInfo::Disabled(
+            "dist-client feature not selected".to_string()
+        )
+    }
+
+    fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
+        Ok(None)
     }
 }
 
@@ -201,15 +211,81 @@ impl DistClientContainer {
         }
     }
 
-    fn get_client(&self) -> Option<Arc<dist::Client>> {
+    pub fn reset_state(&self) {
+        let mut guard = self.state.lock();
+        let state = guard.as_mut().unwrap();
+        let state: &mut DistClientState = &mut **state;
+        match mem::replace(state, DistClientState::Disabled) {
+            DistClientState::Some(cfg, _) |
+            DistClientState::FailWithMessage(cfg, _) |
+            DistClientState::RetryCreateAt(cfg, _) => {
+                warn!("State reset. Will recreate");
+                *state = DistClientState::RetryCreateAt(
+                    cfg,
+                    Instant::now() - Duration::from_secs(1)
+                );
+            },
+            DistClientState::Disabled => (),
+        }
+    }
+
+    pub fn get_status(&self) -> DistInfo {
+        let mut guard = self.state.lock();
+        let state = guard.as_mut().unwrap();
+        let state: &mut DistClientState = &mut **state;
+        match state {
+            DistClientState::Disabled => DistInfo::Disabled(
+                "disabled".to_string(),
+            ),
+            DistClientState::FailWithMessage(cfg, _) => DistInfo::NotConnected(
+                cfg.scheduler_url.clone(),
+                "enabled, auth not configured".to_string(),
+            ),
+            DistClientState::RetryCreateAt(cfg, _) => DistInfo::NotConnected(
+                cfg.scheduler_url.clone(),
+                "enabled, not connected, will retry".to_string(),
+            ),
+            DistClientState::Some(cfg, client) => {
+                match client.do_get_status().wait() {
+                    Ok(res) => DistInfo::SchedulerStatus(cfg.scheduler_url.clone(),
+                                                         res),
+                    Err(_) => DistInfo::NotConnected(
+                        cfg.scheduler_url.clone(),
+                        "could not communicate with scheduler".to_string(),
+                    ),
+                }
+            },
+        }
+    }
+
+    fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
         let mut guard = self.state.lock();
         let state = guard.as_mut().unwrap();
         let state: &mut DistClientState = &mut **state;
         Self::maybe_recreate_state(state);
-        match state {
-            DistClientState::Some(dc) => Some(dc.clone()),
-            DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => None,
-        }
+        let res = match state {
+            DistClientState::Some(_, dc) => Ok(Some(dc.clone())),
+            DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => {
+                Ok(None)
+            },
+            DistClientState::FailWithMessage(_, msg) => {
+                Err(Error::from(msg.clone()))
+            },
+        };
+        match res {
+            Err(_) => {
+                let config = match mem::replace(state, DistClientState::Disabled) {
+                    DistClientState::FailWithMessage(config, _) => config,
+                    _ => unreachable!(),
+                };
+                // The client is most likely mis-configured, make sure we
+                // re-create on our next attempt.
+                *state = DistClientState::RetryCreateAt(config,
+                                                        Instant::now() - Duration::from_secs(1));
+            },
+            _ => (),
+        };
+        res
     }
 
     fn maybe_recreate_state(state: &mut DistClientState) {
@@ -243,6 +319,23 @@ impl DistClientContainer {
                 }
             }};
         }
+
+        macro_rules! try_or_fail_with_message {
+            ($v:expr) => {{
+                match $v {
+                    Ok(v) => v,
+                    Err(e) => {
+                        use error_chain::ChainedError;
+                        let errmsg = e.display_chain();
+                        error!("{}", errmsg);
+                        return DistClientState::FailWithMessage(
+                            config,
+                            errmsg.to_string()
+                        );
+                    }
+                }
+            }};
+        }
         // TODO: NLL would avoid this clone
         match config.scheduler_url.clone() {
             Some(addr) => {
@@ -260,10 +353,12 @@ impl DistClientContainer {
                         auth_url,
                     } => Self::get_cached_config_auth_token(auth_url),
                 };
-                // TODO: NLL would let us move this inside the previous match
-                let auth_token = try_or_retry_later!(
-                    auth_token.chain_err(|| "could not load client auth token")
+                let auth_token = try_or_fail_with_message!(
+                    auth_token.chain_err(|| {
+                        "could not load client auth token, run |sccache --dist-auth|"
+                    })
                 );
+                // TODO: NLL would let us move this inside the previous match
                 let dist_client = dist::http::Client::new(
                     &config.pool,
                     url,
@@ -275,8 +370,19 @@ impl DistClientContainer {
                 let dist_client = try_or_retry_later!(
                     dist_client.chain_err(|| "failure during dist client creation")
                 );
-                info!("Successfully created dist client");
-                DistClientState::Some(Arc::new(dist_client))
+                match dist_client.do_get_status().wait() {
+                    Ok(res) => {
+                        info!("Successfully created dist client with {:?} cores across {:?} servers", res.num_cpus, res.num_servers);
+                        DistClientState::Some(config, Arc::new(dist_client))
+                    },
+                    Err(_) => {
+                        warn!("Scheduler address configured, but could not communicate with scheduler");
+                        DistClientState::RetryCreateAt(
+                            config,
+                            Instant::now() + DIST_CLIENT_RECREATE_TIMEOUT,
+                        )
+                    }
+                }
             }
             None => {
                 info!("No scheduler address configured, disabling distributed sccache");
@@ -286,7 +392,7 @@ impl DistClientContainer {
     }
 
     fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
-        let cached_config = config::CachedConfig::load()?;
+        let cached_config = config::CachedConfig::reload()?;
         cached_config
             .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))
             .ok_or_else(|| {
@@ -351,7 +457,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         runtime: Runtime,
         client: Client,
         dist_client: DistClientContainer,
-        storage: Arc<Storage>,
+        storage: Arc<dyn Storage>,
     ) -> Result<SccacheServer<C>> {
         let addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
         let listener = TcpListener::bind(&SocketAddr::V4(addr))?;
@@ -380,7 +486,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
 
     /// Set the storage this server will use.
     #[allow(dead_code)]
-    pub fn set_storage(&mut self, storage: Arc<Storage>) {
+    pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
         self.service.storage = storage;
     }
 
@@ -414,7 +520,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         self._run(Box::new(shutdown.then(|_| Ok(()))))
     }
 
-    fn _run<'a>(self, shutdown: Box<Future<Item = (), Error = ()> + 'a>) -> io::Result<()> {
+    fn _run<'a>(self, shutdown: Box<dyn Future<Item = (), Error = ()> + 'a>) -> io::Result<()> {
         let SccacheServer {
             mut runtime,
             listener,
@@ -453,7 +559,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         });
 
         let mut futures = vec![
-            Box::new(server) as Box<Future<Item = _, Error = _>>,
+            Box::new(server) as Box<dyn Future<Item = _, Error = _>>,
             Box::new(
                 shutdown
                     .map_err(|()| io::Error::new(io::ErrorKind::Other, "shutdown signal failed")),
@@ -515,10 +621,10 @@ struct SccacheService<C: CommandCreatorSync> {
     dist_client: Rc<DistClientContainer>,
 
     /// Cache storage.
-    storage: Arc<Storage>,
+    storage: Arc<dyn Storage>,
 
     /// A cache of known compiler info.
-    compilers: Rc<RefCell<HashMap<PathBuf, Option<(Box<Compiler<C>>, FileTime)>>>>,
+    compilers: Rc<RefCell<HashMap<PathBuf, Option<(Box<dyn Compiler<C>>, FileTime)>>>>,
 
     /// Thread pool to execute work in
     pool: CpuPool,
@@ -582,6 +688,10 @@ where
                 debug!("handle_client: get_stats");
                 Box::new(self.get_info().map(Response::Stats))
             }
+            Request::DistStatus => {
+                debug!("handle_client: dist_status");
+                Box::new(self.get_dist_status().map(Response::DistStatus))
+            }
             Request::ZeroStats => {
                 debug!("handle_client: zero_stats");
                 self.zero_stats();
@@ -613,7 +723,7 @@ where
 {
     pub fn new(
         dist_client: DistClientContainer,
-        storage: Arc<Storage>,
+        storage: Arc<dyn Storage>,
         client: &Client,
         pool: CpuPool,
         tx: mpsc::Sender<ServerMessage>,
@@ -654,7 +764,7 @@ where
             .from_err::<Error>()
             .and_then(move |input| self.call(input))
             .and_then(|message| {
-                let f: Box<Stream<Item = _, Error = _>> = match message {
+                let f: Box<dyn Stream<Item = _, Error = _>> = match message {
                     Message::WithoutBody(message) => Box::new(stream::once(Ok(Frame::Message {
                         message,
                         body: false,
@@ -671,6 +781,11 @@ where
             }).flatten()
             .forward(sink)
             .map(|_| ())
+    }
+
+    /// Get dist status.
+    fn get_dist_status(&self) -> SFuture<DistInfo> {
+        f_ok(self.dist_client.get_status())
     }
 
     /// Get info and stats about the cache.
@@ -718,7 +833,7 @@ where
         &self,
         path: PathBuf,
         env: &[(OsString, OsString)],
-    ) -> SFuture<Option<Box<Compiler<C>>>> {
+    ) -> SFuture<Result<Box<dyn Compiler<C>>>> {
         trace!("compiler_info");
         let mtime = ftry!(metadata(&path).map(|attr| FileTime::from_last_modification_time(&attr)));
         //TODO: properly handle rustup overrides. Currently this will
@@ -727,16 +842,14 @@ where
         let result = match self.compilers.borrow().get(&path) {
             // It's a hit only if the mtime matches.
             Some(&Some((ref c, ref cached_mtime))) if *cached_mtime == mtime => {
-                Some(Some(c.clone()))
+                Some(c.clone())
             }
-            // We cache non-results.
-            Some(&None) => Some(None),
             _ => None,
         };
         match result {
             Some(info) => {
                 trace!("compiler_info cache hit");
-                f_ok(info)
+                f_ok(Ok(info))
             }
             None => {
                 trace!("compiler_info cache miss");
@@ -747,10 +860,12 @@ where
 
                 let info = get_compiler_info(&self.creator, &path, env, &self.pool);
                 Box::new(info.then(move |info| {
-                    let info = info.ok();
-                    me.compilers
-                        .borrow_mut()
-                        .insert(path, info.clone().map(|i| (i, mtime)));
+                    let map_info = match info {
+                        Ok(ref c) => Some((c.clone(), mtime)),
+                        Err(_) => None,
+                    };
+                    me.compilers.borrow_mut()
+                        .insert(path, map_info);
                     Ok(info)
                 }))
             }
@@ -761,21 +876,21 @@ where
     /// If so, run `start_compile_task` to execute it.
     fn check_compiler(
         &self,
-        compiler: Option<Box<Compiler<C>>>,
+        compiler: Result<Box<dyn Compiler<C>>>,
         cmd: Vec<OsString>,
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
     ) -> SccacheResponse {
         let mut stats = self.stats.borrow_mut();
         match compiler {
-            None => {
-                debug!("check_compiler: Unsupported compiler");
+            Err(e) => {
+                debug!("check_compiler: Unsupported compiler: {}", e.to_string());
                 stats.requests_unsupported_compiler += 1;
                 return Message::WithoutBody(Response::Compile(
-                    CompileResponse::UnsupportedCompiler,
+                    CompileResponse::UnsupportedCompiler(OsString::from(e.to_string())),
                 ));
             }
-            Some(c) => {
+            Ok(c) => {
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
@@ -817,8 +932,8 @@ where
     /// the result in the cache.
     fn start_compile_task(
         &self,
-        compiler: Box<Compiler<C>>,
-        hasher: Box<CompilerHasher<C>>,
+        compiler: Box<dyn Compiler<C>>,
+        hasher: Box<dyn CompilerHasher<C>>,
         arguments: Vec<OsString>,
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
@@ -913,6 +1028,13 @@ where
                     };
                     res.stdout = output.stdout;
                     res.stderr = output.stderr;
+                }
+                Err(Error(ErrorKind::HttpClientError(msg), _)) => {
+                    me.dist_client.reset_state();
+                    let errmsg = format!("[{:?}] http error status: {}", out_pretty, msg);
+                    error!("{}", errmsg);
+                    res.retcode = Some(1);
+                    res.stderr = errmsg.as_bytes().to_vec();
                 }
                 Err(err) => {
                     use std::fmt::Write;
@@ -1049,6 +1171,16 @@ pub struct ServerInfo {
     pub cache_location: String,
     pub cache_size: Option<u64>,
     pub max_cache_size: Option<u64>,
+}
+
+/// Status of the dist client.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum DistInfo {
+    Disabled(String),
+    #[cfg(feature = "dist-client")]
+    NotConnected(Option<config::HTTPUrl>, String),
+    #[cfg(feature = "dist-client")]
+    SchedulerStatus(Option<config::HTTPUrl>, dist::SchedulerStatusResult),
 }
 
 impl Default for ServerStats {

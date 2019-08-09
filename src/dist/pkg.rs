@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use dist;
+use crate::dist;
 use std::io;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::str;
-use tar;
 
-use errors::*;
+use crate::errors::*;
 
 pub use self::toolchain_imp::*;
 
@@ -28,11 +27,11 @@ pub trait ToolchainPackager: Send {
 }
 
 pub trait InputsPackager: Send {
-    fn write_inputs(self: Box<Self>, wtr: &mut io::Write) -> Result<dist::PathTransformer>;
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer>;
 }
 
 pub trait OutputsRepackager {
-    fn repackage_outputs(self: Box<Self>, wtr: &mut io::Write) -> Result<dist::PathTransformer>;
+    fn repackage_outputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer>;
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -40,7 +39,7 @@ mod toolchain_imp {
     use std::fs;
     use super::ToolchainPackager;
 
-    use errors::*;
+    use crate::errors::*;
 
     // Distributed client, but an unsupported platform for toolchain packaging so
     // create a failing implementation that will conflict with any others.
@@ -60,10 +59,9 @@ mod toolchain_imp {
     use std::process;
     use std::str;
     use super::tarify_path;
-    use tar;
     use walkdir::WalkDir;
 
-    use errors::*;
+    use crate::errors::*;
 
     pub struct ToolchainPackageBuilder {
         // Put dirs and file in a deterministic order (map from tar_path -> real_path)
@@ -146,7 +144,6 @@ mod toolchain_imp {
         }
 
         pub fn into_compressed_tar<W: Write>(self, writer: W) -> Result<()> {
-            use flate2;
             use flate2::write::GzEncoder;
             let ToolchainPackageBuilder { dir_set, file_set } = self;
 
@@ -312,7 +309,7 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
 
     // tar-rs imposes that `set_path` takes a relative path
     assert!(dest.starts_with("/"));
-    let dest = dest.trim_left_matches("/");
+    let dest = dest.trim_start_matches("/");
     assert!(!dest.starts_with("/"));
     // `set_path` converts its argument to a Path and back to bytes on Windows, so this is
     // a bit of an inefficient round-trip. Windows path separators will also be normalised

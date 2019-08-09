@@ -14,23 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![deny(rust_2018_idioms)]
 #![allow(dead_code, unused_imports)]
 
-extern crate assert_cmd;
-extern crate cc;
-extern crate env_logger;
-extern crate escargot;
 #[macro_use]
 extern crate log;
-extern crate predicates;
-extern crate sccache;
-extern crate serde_json;
-extern crate tempdir;
-extern crate which;
-
 use assert_cmd::prelude::*;
 use escargot::CargoBuild;
-use harness::{
+use crate::harness::{
     sccache_command,
     sccache_client_cfg,
     start_local_daemon, stop_local_daemon,

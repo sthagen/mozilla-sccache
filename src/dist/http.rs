@@ -21,20 +21,17 @@ pub use self::server::{
 };
 
 mod common {
-    use bincode;
     #[cfg(feature = "dist-client")]
     use futures::{Future, Stream};
     use hyperx::header;
-    use reqwest;
-    use serde;
     #[cfg(feature = "dist-server")]
     use std::collections::HashMap;
     use std::fmt;
 
-    use dist;
+    use crate::dist;
 
-    use errors::*;
-    use util::RequestExt;
+    use crate::errors::*;
+    use crate::util::RequestExt;
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147
     pub trait ReqwestRequestBuilderExt: Sized {
@@ -57,7 +54,7 @@ mod common {
             self.set_header(header::Authorization(header::Bearer { token }))
         }
     }
-    impl ReqwestRequestBuilderExt for reqwest::async::RequestBuilder {
+    impl ReqwestRequestBuilderExt for reqwest::r#async::RequestBuilder {
         fn bincode<T: serde::Serialize + ?Sized>(self, bincode: &T) -> Result<Self> {
             let bytes =
                 bincode::serialize(bincode).chain_err(|| "Failed to serialize body to bincode")?;
@@ -94,7 +91,7 @@ mod common {
     }
     #[cfg(feature = "dist-client")]
     pub fn bincode_req_fut<T: serde::de::DeserializeOwned + 'static>(
-        req: reqwest::async::RequestBuilder,
+        req: reqwest::r#async::RequestBuilder,
     ) -> SFuture<T> {
         Box::new(
             req.send()
@@ -107,11 +104,16 @@ mod common {
                         .map_err(Into::into)
                 }).and_then(|(status, body)| {
                     if !status.is_success() {
-                        return f_err(format!(
+                        let errmsg = format!(
                             "Error {}: {}",
                             status.as_u16(),
                             String::from_utf8_lossy(&body)
-                        ));
+                        );
+                        if status.is_client_error() {
+                            return f_err(ErrorKind::HttpClientError(errmsg));
+                        } else {
+                            return f_err(errmsg);
+                        }
                     }
                     match bincode::deserialize(&body) {
                         Ok(r) => f_ok(r),
@@ -188,7 +190,7 @@ mod common {
     }
     // cert_pem is quite long so elide it (you can retrieve it by hitting the server url anyway)
     impl fmt::Debug for HeartbeatServerHttpRequest {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             let HeartbeatServerHttpRequest {
                 jwt_key,
                 num_cpus,
@@ -208,8 +210,7 @@ mod common {
 }
 
 pub mod urls {
-    use dist::{JobId, ServerId};
-    use reqwest;
+    use crate::dist::{JobId, ServerId};
 
     pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> reqwest::Url {
         scheduler_url
@@ -270,18 +271,11 @@ pub mod urls {
 
 #[cfg(feature = "dist-server")]
 mod server {
-    use bincode;
     use byteorder::{BigEndian, ReadBytesExt};
     use flate2::read::ZlibDecoder as ZlibReadDecoder;
-    use jwt;
-    use num_cpus;
-    use openssl;
-    use rand::{self, RngCore};
-    use reqwest;
-    use rouille::{self, accept};
-    use serde;
-    use serde_json;
-    use std;
+    use crate::jwt;
+    use rand::RngCore;
+    use rouille::accept;
     use std::collections::HashMap;
     use std::io::Read;
     use std::net::SocketAddr;
@@ -297,12 +291,12 @@ mod server {
         ReqwestRequestBuilderExt, RunJobHttpRequest, ServerCertificateHttpResponse,
     };
     use super::urls;
-    use dist::{
+    use crate::dist::{
         self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAuthorizer,
         JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
         SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
     };
-    use errors::*;
+    use crate::errors::*;
 
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
     const HEARTBEAT_ERROR_INTERVAL: Duration = Duration::from_secs(10);
@@ -344,6 +338,16 @@ mod server {
             .set_pubkey(privkey.as_ref())
             .chain_err(|| "failed to set pubkey for x509")?;
 
+        let mut name = openssl::x509::X509Name::builder()?;
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME,
+                                 "sccache-internal")?;
+        let name = name.build();
+
+        builder.set_subject_name(&name)
+            .chain_err(|| "failed to set subject name")?;
+        builder.set_issuer_name(&name)
+            .chain_err(|| "failed to set issuer name")?;
+
         // Add the SubjectAlternativeName
         let extension = openssl::x509::extension::SubjectAlternativeName::new()
             .ip(&addr.ip().to_string())
@@ -382,7 +386,7 @@ mod server {
     pub trait ClientAuthCheck: Send + Sync {
         fn check(&self, token: &str) -> StdResult<(), ClientVisibleMsg>;
     }
-    pub type ServerAuthCheck = Box<Fn(&str) -> Option<ServerId> + Send + Sync>;
+    pub type ServerAuthCheck = Box<dyn Fn(&str) -> Option<ServerId> + Send + Sync>;
 
     const JWT_KEY_LENGTH: usize = 256 / 8;
     lazy_static! {
@@ -423,7 +427,7 @@ mod server {
                 RouilleBincodeError::ParseError(_) => "error while parsing the bincode body",
             }
         }
-        fn cause(&self) -> Option<&std::error::Error> {
+        fn cause(&self) -> Option<&dyn std::error::Error> {
             match *self {
                 RouilleBincodeError::ParseError(ref e) => Some(e),
                 _ => None,
@@ -431,7 +435,7 @@ mod server {
         }
     }
     impl std::fmt::Display for RouilleBincodeError {
-        fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+        fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
             write!(fmt, "{}", std::error::Error::description(self))
         }
     }
@@ -463,7 +467,7 @@ mod server {
 
     impl<'a> ErrJson<'a> {
         fn from_err<E: ?Sized + std::error::Error>(err: &'a E) -> ErrJson<'a> {
-            let cause = err.cause().map(ErrJson::from_err).map(Box::new);
+            let cause = err.source().map(ErrJson::from_err).map(Box::new);
             ErrJson {
                 description: err.description(),
                 cause,
@@ -481,11 +485,11 @@ mod server {
                     // TODO: would ideally just use error_chain
                     use std::error::Error;
                     let mut err_msg = err.to_string();
-                    let mut maybe_cause = err.cause();
+                    let mut maybe_cause = err.source();
                     while let Some(cause) = maybe_cause {
                         err_msg.push_str(", caused by: ");
                         err_msg.push_str(cause.description());
-                        maybe_cause = cause.cause()
+                        maybe_cause = cause.source();
                     }
 
                     warn!("Res {} error: {}", $reqid, err_msg);
@@ -636,7 +640,7 @@ mod server {
         public_addr: SocketAddr,
         handler: S,
         // Is this client permitted to use the scheduler?
-        check_client_auth: Box<ClientAuthCheck>,
+        check_client_auth: Box<dyn ClientAuthCheck>,
         // Do we believe the server is who they appear to be?
         check_server_auth: ServerAuthCheck,
     }
@@ -645,7 +649,7 @@ mod server {
         pub fn new(
             public_addr: SocketAddr,
             handler: S,
-            check_client_auth: Box<ClientAuthCheck>,
+            check_client_auth: Box<dyn ClientAuthCheck>,
             check_server_auth: ServerAuthCheck,
         ) -> Self {
             Self {
@@ -667,13 +671,31 @@ mod server {
                 client: Mutex::new(reqwest::Client::new()),
             };
 
-            macro_rules! check_server_auth_or_401 {
+            macro_rules! check_server_auth_or_err {
                 ($request:ident) => {{
                     match bearer_http_auth($request).and_then(&*check_server_auth) {
-                        Some(server_id) if server_id.addr().ip() == $request.remote_addr().ip() => {
-                            server_id
-                        }
-                        Some(_) => return make_401("invalid_bearer_token_mismatched_address"),
+                        Some(server_id) => {
+                            let origin_ip = if let Some(header_val) = $request.header("X-Real-IP") {
+                                trace!("X-Real-IP: {:?}", header_val);
+                                match header_val.parse() {
+                                    Ok(ip) => ip,
+                                    Err(err) => {
+                                        warn!("X-Real-IP value {:?} could not be parsed: {:?}",
+                                              header_val, err);
+                                        return rouille::Response::empty_400()
+                                    }
+                                }
+                            } else {
+                                $request.remote_addr().ip()
+                            };
+                            if server_id.addr().ip() != origin_ip {
+                                trace!("server ip: {:?}", server_id.addr().ip());
+                                trace!("request ip: {:?}", $request.remote_addr().ip());
+                                return make_401("invalid_bearer_token_mismatched_address")
+                            } else {
+                                server_id
+                            }
+                        },
                         None => return make_401("invalid_bearer_token"),
                     }
                 }};
@@ -757,7 +779,7 @@ mod server {
                         prepare_response(&request, &res)
                     },
                     (POST) (/api/v1/scheduler/heartbeat_server) => {
-                        let server_id = check_server_auth_or_401!(request);
+                        let server_id = check_server_auth_or_err!(request);
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!("Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
@@ -776,7 +798,7 @@ mod server {
                         prepare_response(&request, &res)
                     },
                     (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
-                        let server_id = check_server_auth_or_401!(request);
+                        let server_id = check_server_auth_or_err!(request);
                         let job_state = try_or_400_log!(req_id, bincode_input(request));
                         trace!("Req {}: job state: {:?}", req_id, job_state);
 
@@ -937,7 +959,7 @@ mod server {
                         job_auth_or_401!(request, &job_authorizer, job_id);
                         trace!("Req {}: submit_toolchain({})", req_id, job_id);
 
-                        let mut body = request.data().expect("body was already read in submit_toolchain");
+                        let body = request.data().expect("body was already read in submit_toolchain");
                         let toolchain_rdr = ToolchainReader(Box::new(body));
                         let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(&requester, job_id, toolchain_rdr));
                         prepare_response(&request, &res)
@@ -1001,19 +1023,17 @@ mod server {
 #[cfg(feature = "dist-client")]
 mod client {
     use super::super::cache;
-    use bincode;
     use byteorder::{BigEndian, WriteBytesExt};
-    use config;
-    use dist::pkg::{InputsPackager, ToolchainPackager};
-    use dist::{
+    use crate::config;
+    use crate::dist::pkg::{InputsPackager, ToolchainPackager};
+    use crate::dist::{
         self, AllocJobResult, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
-        SubmitToolchainResult, Toolchain,
+        SubmitToolchainResult, Toolchain, SchedulerStatusResult,
     };
     use flate2::write::ZlibEncoder as ZlibWriteEncoder;
     use flate2::Compression;
     use futures::Future;
     use futures_cpupool::CpuPool;
-    use reqwest;
     use std::collections::HashMap;
     use std::io::Write;
     use std::path::Path;
@@ -1025,7 +1045,7 @@ mod client {
         RunJobHttpRequest, ServerCertificateHttpResponse,
     };
     use super::urls;
-    use errors::*;
+    use crate::errors::*;
 
     const REQUEST_TIMEOUT_SECS: u64 = 600;
 
@@ -1037,7 +1057,7 @@ mod client {
         // TODO: this should really only use the async client, but reqwest async bodies are extremely limited
         // and only support owned bytes, which means the whole toolchain would end up in memory
         client: Arc<Mutex<reqwest::Client>>,
-        client_async: Arc<Mutex<reqwest::async::Client>>,
+        client_async: Arc<Mutex<reqwest::r#async::Client>>,
         pool: CpuPool,
         tc_cache: Arc<cache::ClientToolchains>,
     }
@@ -1056,7 +1076,7 @@ mod client {
                 .timeout(timeout)
                 .build()
                 .chain_err(|| "failed to create a HTTP client")?;
-            let client_async = reqwest::async::ClientBuilder::new()
+            let client_async = reqwest::r#async::ClientBuilder::new()
                 .timeout(timeout)
                 .build()
                 .chain_err(|| "failed to create an async HTTP client")?;
@@ -1076,13 +1096,13 @@ mod client {
 
         fn update_certs(
             client: &mut reqwest::Client,
-            client_async: &mut reqwest::async::Client,
+            client_async: &mut reqwest::r#async::Client,
             certs: &mut HashMap<Vec<u8>, Vec<u8>>,
             cert_digest: Vec<u8>,
             cert_pem: Vec<u8>,
         ) -> Result<()> {
             let mut client_builder = reqwest::ClientBuilder::new();
-            let mut client_async_builder = reqwest::async::ClientBuilder::new();
+            let mut client_async_builder = reqwest::r#async::ClientBuilder::new();
             // Add all the certificates we know about
             client_builder = client_builder.add_root_certificate(
                 reqwest::Certificate::from_pem(&cert_pem)
@@ -1130,7 +1150,6 @@ mod client {
             let server_certs = self.server_certs.clone();
             Box::new(
                 bincode_req_fut(req)
-                    .map_err(|e| e.chain_err(|| "POST to scheduler alloc_job failed"))
                     .and_then(move |res| match res {
                         AllocJobHttpResponse::Success {
                             job_alloc,
@@ -1171,6 +1190,14 @@ mod client {
                     }),
             )
         }
+        fn do_get_status(&self) -> SFuture<SchedulerStatusResult> {
+            let scheduler_url = self.scheduler_url.clone();
+            let url = urls::scheduler_status(&scheduler_url);
+            let req = self.client.lock().unwrap().get(url);
+            Box::new(self.pool.spawn_fn(move || {
+                bincode_req(req)
+            }))
+        }
         fn do_submit_toolchain(
             &self,
             job_alloc: JobAlloc,
@@ -1179,7 +1206,7 @@ mod client {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
                     let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id);
-                    let mut req = self.client.lock().unwrap().post(url);
+                    let req = self.client.lock().unwrap().post(url);
 
                     Box::new(self.pool.spawn_fn(move || {
                         let req = req.bearer_auth(job_alloc.auth.clone()).body(toolchain_file);
@@ -1195,7 +1222,7 @@ mod client {
             job_alloc: JobAlloc,
             command: CompileCommand,
             outputs: Vec<String>,
-            inputs_packager: Box<InputsPackager>,
+            inputs_packager: Box<dyn InputsPackager>,
         ) -> SFuture<(RunJobResult, PathTransformer)> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
             let mut req = self.client.lock().unwrap().post(url);
@@ -1238,7 +1265,7 @@ mod client {
             &self,
             compiler_path: &Path,
             weak_key: &str,
-            toolchain_packager: Box<ToolchainPackager>,
+            toolchain_packager: Box<dyn ToolchainPackager>,
         ) -> SFuture<(Toolchain, Option<String>)> {
             let compiler_path = compiler_path.to_owned();
             let weak_key = weak_key.to_owned();

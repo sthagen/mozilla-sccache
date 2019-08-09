@@ -11,7 +11,7 @@ extern crate tempdir;
 
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
-use harness::{
+use crate::harness::{
     sccache_command,
     start_local_daemon, stop_local_daemon,
     get_stats,
@@ -49,7 +49,10 @@ fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path
     let obj_file = "x.o";
     write_source(tmpdir, source_file, "int x() { return 5; }");
     sccache_command()
-        .args(&["gcc", "-c"]).arg(tmpdir.join(source_file)).arg("-o").arg(tmpdir.join(obj_file))
+        .args(&[std::env::var("CC").unwrap_or("gcc".to_string()).as_str(), "-c"])
+        .arg(tmpdir.join(source_file))
+        .arg("-o")
+        .arg(tmpdir.join(obj_file))
         .envs(envs)
         .assert()
         .success();
@@ -162,10 +165,10 @@ impl ServerIncoming for FailingServer {
         let state = JobState::Ready;
         Ok(AssignJobResult { need_toolchain, state })
     }
-    fn handle_submit_toolchain(&self, _requester: &ServerOutgoing, _job_id: JobId, _tc_rdr: ToolchainReader) -> Result<SubmitToolchainResult> {
+    fn handle_submit_toolchain(&self, _requester: &dyn ServerOutgoing, _job_id: JobId, _tc_rdr: ToolchainReader) -> Result<SubmitToolchainResult> {
         panic!("should not have submitted toolchain")
     }
-    fn handle_run_job(&self, requester: &ServerOutgoing, job_id: JobId, _command: CompileCommand, _outputs: Vec<String>, _inputs_rdr: InputsReader) -> Result<RunJobResult> {
+    fn handle_run_job(&self, requester: &dyn ServerOutgoing, job_id: JobId, _command: CompileCommand, _outputs: Vec<String>, _inputs_rdr: InputsReader) -> Result<RunJobResult> {
         requester.do_update_job_state(job_id, JobState::Started).chain_err(|| "Updating job state failed")?;
         bail!("internal build failure")
     }

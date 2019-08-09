@@ -3,14 +3,12 @@ use futures::sync::oneshot;
 use futures::prelude::*;
 use futures::future;
 use http::StatusCode;
-use hyper;
 use hyper::body::Payload;
 use hyper::server::conn::{AddrIncoming};
 use hyper::service::{Service};
 use hyper::{Body, Request, Response, Server};
 use hyperx::header::{ContentLength, ContentType};
 use serde::Serialize;
-use serde_json;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::io;
@@ -22,9 +20,9 @@ use tokio::runtime::current_thread::Runtime;
 use url::Url;
 use uuid::Uuid;
 
-use util::RequestExt;
+use crate::util::RequestExt;
 
-use errors::*;
+use crate::errors::*;
 
 // These (arbitrary) ports need to be registered as valid redirect urls in the oauth provider you're using
 pub const VALID_PORTS: &[u16] = &[12731, 32492, 56909];
@@ -33,14 +31,14 @@ const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 const MIN_TOKEN_VALIDITY_WARNING: &str = "two days";
 
 trait ServeFn:
-    Fn(Request<Body>) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send>
+    Fn(Request<Body>) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>
     + Copy
     + Send
     + 'static
 {
 }
 impl<T> ServeFn for T where
-    T: Fn(Request<Body>) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send>
+    T: Fn(Request<Body>) -> Box<dyn Future<Item = Response<Body>, Error = hyper::Error> + Send>
         + Copy
         + Send
         + 'static
@@ -63,7 +61,7 @@ fn serve_sfuture(serve: fn(Request<Body>) -> SFutureSend<Response<Body>>) -> imp
                 .set_header(ContentLength(len as u64))
                 .body(body.into())
                 .unwrap())
-        })) as Box<Future<Item = _, Error = _> + Send>
+        })) as Box<dyn Future<Item = _, Error = _> + Send>
     }
 }
 
@@ -129,21 +127,18 @@ mod code_grant_pkce {
         html_response, json_response, query_pairs, MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING,
         REDIRECT_WITH_AUTH_JSON,
     };
-    use base64;
-    use crypto;
     use crypto::digest::Digest;
     use futures::future;
     use futures::sync::oneshot;
     use hyper::{Body, Method, Request, Response, StatusCode};
-    use rand::{self, RngCore};
-    use reqwest;
+    use rand::RngCore;
     use std::collections::HashMap;
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use url::Url;
 
-    use errors::*;
+    use crate::errors::*;
 
     // Code request - https://tools.ietf.org/html/rfc7636#section-4.3
     const CLIENT_ID_PARAM: &str = "client_id";
@@ -339,7 +334,7 @@ mod implicit {
     use std::time::{Duration, Instant};
     use url::Url;
 
-    use errors::*;
+    use crate::errors::*;
 
     // Request - https://tools.ietf.org/html/rfc6749#section-4.2.1
     const CLIENT_ID_PARAM: &str = "client_id";
@@ -495,7 +490,7 @@ where
     F: Fn(Request<ReqBody>) -> Ret,
     ReqBody: Payload,
     Ret: IntoFuture<Item=Response<ResBody>>,
-    Ret::Error: Into<Box<StdError + Send + Sync>>,
+    Ret::Error: Into<Box<dyn StdError + Send + Sync>>,
     ResBody: Payload,
 {
     type ReqBody = ReqBody;
