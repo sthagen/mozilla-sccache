@@ -85,7 +85,7 @@ pub fn main() {
                 println!("caused by: {}", e);
             }
             cmdline::get_app().print_help().unwrap();
-            println!("");
+            println!();
             1
         }
     });
@@ -99,4 +99,3 @@ fn init_logging() {
         }
     }
 }
-

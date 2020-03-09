@@ -134,6 +134,12 @@ impl CacheWrite {
     }
 }
 
+impl Default for CacheWrite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// An interface to cache storage.
 pub trait Storage {
     /// Get a cache entry by `key`.
@@ -191,14 +197,13 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<dyn Storage> 
                     let service_account_info_opt: Option<gcs::ServiceAccountInfo> =
                         if let Some(ref cred_path) = *cred_path {
                             // Attempt to read the service account key from file
-                            let service_account_key_res: Result<
-                                gcs::ServiceAccountKey,
-                            > = (|| {
+                            let service_account_key_res: Result<gcs::ServiceAccountKey> = (|| {
                                 let mut file = File::open(&cred_path)?;
                                 let mut service_account_json = String::new();
                                 file.read_to_string(&mut service_account_json)?;
                                 Ok(serde_json::from_str(&service_account_json)?)
-                            })();
+                            })(
+                            );
 
                             // warn! if an error was encountered reading the key from the file
                             if let Err(ref e) = service_account_key_res {
@@ -209,7 +214,9 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<dyn Storage> 
                                 );
                             }
 
-                            service_account_key_res.ok().map(|account_key| ServiceAccountInfo::AccountKey(account_key))
+                            service_account_key_res
+                                .ok()
+                                .map(|account_key| ServiceAccountInfo::AccountKey(account_key))
                         } else if let Some(ref url) = *url {
                             Some(ServiceAccountInfo::URL(url.clone()))
                         } else {
@@ -261,10 +268,11 @@ pub fn storage_from_config(config: &Config, pool: &CpuPool) -> Arc<dyn Storage> 
             CacheType::S3(config::S3CacheConfig {
                 ref bucket,
                 ref endpoint,
+                use_ssl,
             }) => {
                 debug!("Trying S3Cache({}, {})", bucket, endpoint);
                 #[cfg(feature = "s3")]
-                match S3Cache::new(&bucket, &endpoint) {
+                match S3Cache::new(&bucket, &endpoint, use_ssl) {
                     Ok(s) => {
                         trace!("Using S3Cache");
                         return Arc::new(s);

@@ -1,4 +1,3 @@
-extern crate arraydeque;
 extern crate base64;
 #[macro_use]
 extern crate clap;
@@ -25,7 +24,6 @@ extern crate syslog;
 extern crate tar;
 extern crate void;
 
-use arraydeque::ArrayDeque;
 use clap::{App, Arg, ArgMatches, SubCommand};
 use rand::RngCore;
 use sccache::config::{
@@ -44,9 +42,9 @@ use std::env;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Instant, Duration};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use syslog::Facility;
 
 use crate::errors::*;
@@ -136,43 +134,56 @@ pub fn get_app<'a, 'b>() -> App<'a, 'b> {
                     SubCommand::with_name("generate-jwt-hs256-server-token")
                         .arg(Arg::from_usage(
                             "--server <SERVER_ADDR> 'Generate a key for the specified server'",
-                        )).arg(
+                        ))
+                        .arg(
                             Arg::from_usage(
                                 "--secret-key [KEY] 'Use specified key to create the token'",
-                            ).required_unless("config"),
-                        ).arg(
+                            )
+                            .required_unless("config"),
+                        )
+                        .arg(
                             Arg::from_usage(
                                 "--config [PATH] 'Use the key from the scheduler config file'",
-                            ).required_unless("secret-key"),
+                            )
+                            .required_unless("secret-key"),
                         ),
-                ).subcommand(
+                )
+                .subcommand(
                     SubCommand::with_name("generate-shared-token").arg(
                         Arg::from_usage(
                             "--bits [BITS] 'Use the specified number of bits of randomness'",
-                        ).default_value("256"),
+                        )
+                        .default_value("256"),
                     ),
                 ),
-            )
+        )
         .subcommand(
             SubCommand::with_name("scheduler")
-                .arg(Arg::from_usage("--config <PATH> 'Use the scheduler config file at PATH'"))
-                .arg(Arg::from_usage("--syslog <LEVEL> 'Log to the syslog with LEVEL'")
-                     .required(false)
-                     .possible_values(LOG_LEVELS))
-                )
+                .arg(Arg::from_usage(
+                    "--config <PATH> 'Use the scheduler config file at PATH'",
+                ))
+                .arg(
+                    Arg::from_usage("--syslog <LEVEL> 'Log to the syslog with LEVEL'")
+                        .required(false)
+                        .possible_values(LOG_LEVELS),
+                ),
+        )
         .subcommand(
             SubCommand::with_name("server")
-                .arg(Arg::from_usage("--config <PATH> 'Use the server config file at PATH'"))
-                .arg(Arg::from_usage("--syslog <LEVEL> 'Log to the syslog with LEVEL'")
-                     .required(false)
-                     .possible_values(LOG_LEVELS))
+                .arg(Arg::from_usage(
+                    "--config <PATH> 'Use the server config file at PATH'",
+                ))
+                .arg(
+                    Arg::from_usage("--syslog <LEVEL> 'Log to the syslog with LEVEL'")
+                        .required(false)
+                        .possible_values(LOG_LEVELS),
+                ),
         )
 }
 
 fn check_init_syslog<'a>(name: &str, matches: &ArgMatches<'a>) {
     if matches.is_present("syslog") {
-        let level = value_t!(matches, "syslog", log::LevelFilter)
-            .unwrap_or_else(|e| e.exit());
+        let level = value_t!(matches, "syslog", log::LevelFilter).unwrap_or_else(|e| e.exit());
         drop(syslog::init(Facility::LOG_DAEMON, level, Some(name)));
     }
 }
@@ -338,7 +349,8 @@ fn run(command: Command) -> Result<i32> {
                         audience.to_owned(),
                         issuer.to_owned(),
                         &jwks_url,
-                    ).chain_err(|| "Failed to create a checker for valid JWTs")?,
+                    )
+                    .chain_err(|| "Failed to create a checker for valid JWTs")?,
                 ),
                 scheduler_config::ClientAuth::Mozilla { required_groups } => {
                     Box::new(token_check::MozillaCheck::new(required_groups))
@@ -366,7 +378,6 @@ fn run(command: Command) -> Result<i32> {
                     let validation = jwt::Validation {
                         leeway: 0,
                         validate_exp: false,
-                        validate_iat: false,
                         validate_nbf: false,
                         aud: None,
                         iss: None,
@@ -381,7 +392,12 @@ fn run(command: Command) -> Result<i32> {
 
             daemonize()?;
             let scheduler = Scheduler::new();
-            let http_scheduler = dist::http::Scheduler::new(public_addr, scheduler, check_client_auth, check_server_auth);
+            let http_scheduler = dist::http::Scheduler::new(
+                public_addr,
+                scheduler,
+                check_client_auth,
+                check_server_auth,
+            );
             void::unreachable(http_scheduler.start()?);
         }
 
@@ -437,7 +453,8 @@ fn run(command: Command) -> Result<i32> {
                 scheduler_url.to_url(),
                 scheduler_auth,
                 server,
-            ).chain_err(|| "Failed to create sccache HTTP server instance")?;
+            )
+            .chain_err(|| "Failed to create sccache HTTP server instance")?;
             void::unreachable(http_server.start()?)
         }
     }
@@ -454,6 +471,8 @@ fn init_logging() {
 
 const MAX_PER_CORE_LOAD: f64 = 10f64;
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
+const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
+const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
@@ -466,9 +485,6 @@ struct JobDetail {
 pub struct Scheduler {
     job_count: AtomicUsize,
 
-    // Circular buffer of most recently completed jobs
-    finished_jobs: Mutex<ArrayDeque<[(JobId, JobDetail); 1024], arraydeque::Wrapping>>,
-
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
 
@@ -477,6 +493,9 @@ pub struct Scheduler {
 
 struct ServerDetails {
     jobs_assigned: HashSet<JobId>,
+    // Jobs assigned that haven't seen a state change. Can only be pending
+    // or ready.
+    jobs_unclaimed: HashMap<JobId, Instant>,
     last_seen: Instant,
     last_error: Option<Instant>,
     num_cpus: usize,
@@ -489,8 +508,47 @@ impl Scheduler {
         Scheduler {
             job_count: AtomicUsize::new(0),
             jobs: Mutex::new(BTreeMap::new()),
-            finished_jobs: Mutex::new(ArrayDeque::new()),
             servers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn prune_servers(
+        &self,
+        servers: &mut MutexGuard<HashMap<ServerId, ServerDetails>>,
+        jobs: &mut MutexGuard<BTreeMap<JobId, JobDetail>>,
+    ) {
+        let now = Instant::now();
+
+        let mut dead_servers = Vec::new();
+
+        for (&server_id, details) in servers.iter_mut() {
+            if now.duration_since(details.last_seen) > dist::http::HEARTBEAT_TIMEOUT {
+                dead_servers.push(server_id);
+            }
+        }
+
+        for server_id in dead_servers {
+            warn!(
+                "Server {} appears to be dead, pruning it in the scheduler",
+                server_id.addr()
+            );
+            let server_details = servers
+                .remove(&server_id)
+                .expect("server went missing from map");
+            for job_id in server_details.jobs_assigned {
+                warn!(
+                    "Non-terminated job {} was cleaned up in server pruning",
+                    job_id
+                );
+                // A job may be missing here if it failed to allocate
+                // initially, so just warn if it's not present.
+                if jobs.remove(&job_id).is_none() {
+                    warn!(
+                        "Non-terminated job {} assignment originally failed.",
+                        job_id
+                    );
+                }
+            }
         }
     }
 }
@@ -504,21 +562,14 @@ impl SchedulerIncoming for Scheduler {
     ) -> Result<AllocJobResult> {
         let (job_id, server_id, auth) = {
             // LOCKS
-            let mut jobs = self.jobs.lock().unwrap();
             let mut servers = self.servers.lock().unwrap();
 
-            // TODO: NLL would let us simplify this
-            let mut dead_servers = vec![];
             let res = {
                 let mut best = None;
                 let mut best_err = None;
                 let mut best_load: f64 = MAX_PER_CORE_LOAD;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    if now.duration_since(details.last_seen) > dist::http::HEARTBEAT_TIMEOUT {
-                        dead_servers.push(server_id);
-                        continue;
-                    }
                     let load = details.jobs_assigned.len() as f64 / details.num_cpus as f64;
 
                     if let Some(last_error) = details.last_error {
@@ -527,27 +578,35 @@ impl SchedulerIncoming for Scheduler {
                                 details.last_error = None;
                             }
                             match best_err {
-                                Some((_, &mut ServerDetails {
-                                    last_error: Some(best_last_err),
-                                    ..
-                                })) => {
+                                Some((
+                                    _,
+                                    &mut ServerDetails {
+                                        last_error: Some(best_last_err),
+                                        ..
+                                    },
+                                )) => {
                                     if last_error < best_last_err {
-                                        trace!("Selected {:?}, its most recent error is {:?} ago",
-                                               server_id, now - last_error);
+                                        trace!(
+                                            "Selected {:?}, its most recent error is {:?} ago",
+                                            server_id,
+                                            now - last_error
+                                        );
                                         best_err = Some((server_id, details));
                                     }
-                                },
+                                }
                                 _ => {
-                                    trace!("Selected {:?}, its most recent error is {:?} ago",
-                                           server_id, now - last_error);
+                                    trace!(
+                                        "Selected {:?}, its most recent error is {:?} ago",
+                                        server_id,
+                                        now - last_error
+                                    );
                                     best_err = Some((server_id, details));
-                                },
+                                }
                             }
                         }
                     } else if load < best_load {
                         best = Some((server_id, details));
-                        trace!("Selected {:?} as the server with the best load",
-                               server_id);
+                        trace!("Selected {:?} as the server with the best load", server_id);
                         best_load = load;
                         if load == 0f64 {
                             break;
@@ -560,6 +619,10 @@ impl SchedulerIncoming for Scheduler {
                     let job_count = self.job_count.fetch_add(1, Ordering::SeqCst) as u64;
                     let job_id = JobId(job_count);
                     assert!(server_details.jobs_assigned.insert(job_id));
+                    assert!(server_details
+                        .jobs_unclaimed
+                        .insert(job_id, Instant::now())
+                        .is_none());
 
                     info!(
                         "Job {} created and will be assigned to server {:?}",
@@ -576,31 +639,6 @@ impl SchedulerIncoming for Scheduler {
                 }
             };
 
-            // We iterated over all servers, prune any that haven't had a heartbeat for too long
-            for server_id in dead_servers {
-                warn!(
-                    "Server {} appears to be dead, pruning it in the scheduler",
-                    server_id.addr()
-                );
-                let server_details = servers
-                    .remove(&server_id)
-                    .expect("server went missing from map");
-                for job_id in server_details.jobs_assigned {
-                    warn!(
-                        "Non-terminated job {} was cleaned up in server pruning",
-                        job_id
-                    );
-                    // A job may be missing here if it failed to allocate
-                    // initially, so just warn if it's not present.
-                    if jobs.remove(&job_id).is_none() {
-                        warn!(
-                            "Non-terminated job {} assignment originally failed.",
-                            job_id
-                        );
-                    }
-                }
-            }
-
             if let Some(res) = res {
                 res
             } else {
@@ -614,12 +652,14 @@ impl SchedulerIncoming for Scheduler {
         let AssignJobResult {
             state,
             need_toolchain,
-        } = requester.do_assign_job(server_id, job_id, tc, auth.clone())
+        } = requester
+            .do_assign_job(server_id, job_id, tc, auth.clone())
             .chain_err(|| {
                 // LOCKS
                 let mut servers = self.servers.lock().unwrap();
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
+                    entry.jobs_unclaimed.remove(&job_id);
                     if !entry.jobs_assigned.remove(&job_id) {
                         "assign job failed and job not known to the server"
                     } else {
@@ -637,10 +677,9 @@ impl SchedulerIncoming for Scheduler {
                 "Job {} successfully assigned and saved with state {:?}",
                 job_id, state
             );
-            assert!(
-                jobs.insert(job_id, JobDetail { server_id, state })
-                    .is_none()
-            );
+            assert!(jobs
+                .insert(job_id, JobDetail { server_id, state })
+                .is_none());
         }
         let job_alloc = JobAlloc {
             auth,
@@ -665,12 +704,84 @@ impl SchedulerIncoming for Scheduler {
         }
 
         // LOCKS
+        let mut jobs = self.jobs.lock().unwrap();
         let mut servers = self.servers.lock().unwrap();
+
+        self.prune_servers(&mut servers, &mut jobs);
 
         match servers.get_mut(&server_id) {
             Some(ref mut details) if details.server_nonce == server_nonce => {
-                details.last_seen = Instant::now();
+                let now = Instant::now();
+                details.last_seen = now;
+
+                let mut stale_jobs = Vec::new();
+                for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
+                    if now.duration_since(last_seen) < UNCLAIMED_READY_TIMEOUT {
+                        continue;
+                    }
+                    if let Some(detail) = jobs.get(&job_id) {
+                        match detail.state {
+                            JobState::Ready => {
+                                stale_jobs.push(job_id);
+                            }
+                            JobState::Pending => {
+                                if now.duration_since(last_seen) > UNCLAIMED_PENDING_TIMEOUT {
+                                    stale_jobs.push(job_id);
+                                }
+                            }
+                            state => {
+                                warn!("Invalid unclaimed job state for {}: {}", job_id, state);
+                            }
+                        }
+                    } else {
+                        warn!("Unknown stale job {}", job_id);
+                        stale_jobs.push(job_id);
+                    }
+                }
+
+                if stale_jobs.len() > 0 {
+                    warn!(
+                        "The following stale jobs will be de-allocated: {:?}",
+                        stale_jobs
+                    );
+
+                    for job_id in stale_jobs {
+                        if !details.jobs_assigned.remove(&job_id) {
+                            warn!(
+                                "Stale job for server {} not assigned: {}",
+                                server_id.addr(),
+                                job_id
+                            );
+                        }
+                        if details.jobs_unclaimed.remove(&job_id).is_none() {
+                            warn!(
+                                "Unknown stale job for server {}: {}",
+                                server_id.addr(),
+                                job_id
+                            );
+                        }
+                        if jobs.remove(&job_id).is_none() {
+                            warn!(
+                                "Unknown stale job for server {}: {}",
+                                server_id.addr(),
+                                job_id
+                            );
+                        }
+                    }
+                }
+
                 return Ok(HeartbeatServerResult { is_new: false });
+            }
+            Some(ref mut details) if details.server_nonce != server_nonce => {
+                for job_id in details.jobs_assigned.iter() {
+                    if jobs.remove(&job_id).is_none() {
+                        warn!(
+                            "Unknown job found when replacing server {}: {}",
+                            server_id.addr(),
+                            job_id
+                        );
+                    }
+                }
             }
             _ => (),
         }
@@ -681,6 +792,7 @@ impl SchedulerIncoming for Scheduler {
                 last_seen: Instant::now(),
                 last_error: None,
                 jobs_assigned: HashSet::new(),
+                jobs_unclaimed: HashMap::new(),
                 num_cpus,
                 server_nonce,
                 job_authorizer,
@@ -696,7 +808,6 @@ impl SchedulerIncoming for Scheduler {
         job_state: JobState,
     ) -> Result<UpdateJobStateResult> {
         // LOCKS
-        let mut finished_jobs = self.finished_jobs.lock().unwrap();
         let mut jobs = self.jobs.lock().unwrap();
         let mut servers = self.servers.lock().unwrap();
 
@@ -710,14 +821,26 @@ impl SchedulerIncoming for Scheduler {
                     server_id
                 )
             }
+
+            let now = Instant::now();
+            let mut server_details = servers.get_mut(&server_id);
+            if let Some(ref mut details) = server_details {
+                details.last_seen = now;
+            };
+
             match (job_detail.state, job_state) {
-                (JobState::Pending, JobState::Ready) | (JobState::Ready, JobState::Started) => {
+                (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
+                (JobState::Ready, JobState::Started) => {
+                    if let Some(details) = server_details {
+                        details.jobs_unclaimed.remove(&job_id);
+                    } else {
+                        warn!("Job state updated, but server is not known to scheduler")
+                    }
                     entry.get_mut().state = job_state
                 }
                 (JobState::Started, JobState::Complete) => {
-                    let (job_id, job_entry) = entry.remove_entry();
-                    finished_jobs.push_back((job_id, job_entry));
-                    if let Some(entry) = servers.get_mut(&server_id) {
+                    let (job_id, _) = entry.remove_entry();
+                    if let Some(entry) = server_details {
                         assert!(entry.jobs_assigned.remove(&job_id))
                     } else {
                         bail!("Job was marked as finished, but server is not known to scheduler")
@@ -733,11 +856,16 @@ impl SchedulerIncoming for Scheduler {
     }
 
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
-        let servers = self.servers.lock().unwrap();
+        // LOCKS
+        let mut jobs = self.jobs.lock().unwrap();
+        let mut servers = self.servers.lock().unwrap();
+
+        self.prune_servers(&mut servers, &mut jobs);
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
             num_cpus: servers.values().map(|v| v.num_cpus).sum(),
+            in_progress: jobs.len(),
         })
     }
 }
@@ -768,13 +896,12 @@ impl ServerIncoming for Server {
     type Error = Error;
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
         let need_toolchain = !self.cache.lock().unwrap().contains_toolchain(&tc);
-        assert!(
-            self.job_toolchains
-                .lock()
-                .unwrap()
-                .insert(job_id, tc)
-                .is_none()
-        );
+        assert!(self
+            .job_toolchains
+            .lock()
+            .unwrap()
+            .insert(job_id, tc)
+            .is_none());
         let state = if need_toolchain {
             JobState::Pending
         } else {
@@ -809,7 +936,8 @@ impl ServerIncoming for Server {
         Ok(cache
             .insert_with(&tc, |mut file| {
                 io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
-            }).map(|_| SubmitToolchainResult::Success)
+            })
+            .map(|_| SubmitToolchainResult::Success)
             .unwrap_or(SubmitToolchainResult::CannotCache))
     }
     fn handle_run_job(
@@ -823,17 +951,21 @@ impl ServerIncoming for Server {
         requester
             .do_update_job_state(job_id, JobState::Started)
             .chain_err(|| "Updating job state failed")?;
-        let res = match self.job_toolchains.lock().unwrap().remove(&job_id) {
+        let tc = self.job_toolchains.lock().unwrap().remove(&job_id);
+        let res = match tc {
             None => Ok(RunJobResult::JobNotFound),
             Some(tc) => {
-                match self.builder.run_build(tc, command, outputs, inputs_rdr, &self.cache) {
+                match self
+                    .builder
+                    .run_build(tc, command, outputs, inputs_rdr, &self.cache)
+                {
                     Err(e) => Err(e.chain_err(|| "run build failed")),
                     Ok(res) => Ok(RunJobResult::Complete(JobComplete {
                         output: res.output,
                         outputs: res.outputs,
                     })),
                 }
-            },
+            }
         };
         requester
             .do_update_job_state(job_id, JobState::Complete)

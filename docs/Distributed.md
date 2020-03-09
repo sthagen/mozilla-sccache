@@ -27,8 +27,8 @@ Distributed sccache consists of three parts:
    a build
 
 All servers are required to be a 64-bit Linux install. Clients may request
-compilation from Linux, Windows or OSX. Linux compilations will attempt to
-automatically package the compiler in use, while Windows and OSX users will
+compilation from Linux, Windows or macOS. Linux compilations will attempt to
+automatically package the compiler in use, while Windows and macOS users will
 need to specify a toolchain for cross-compilation ahead of time.
 
 ## Communication
@@ -221,7 +221,7 @@ auth = { type = "oauth2_implicit", client_id = "...", auth_url = "..." }
 
 The client should then run `sccache --dist-auth` and follow the instructions to retrieve
 a token. This will be automatically cached locally for the token expiry period (manual
-revalidatation will be necessary after expiry).
+revalidation will be necessary after expiry).
 
 #### Token
 

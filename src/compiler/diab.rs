@@ -18,18 +18,18 @@ use crate::compiler::args::{
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
 };
 use crate::compiler::c::{CCompilerImpl, CCompilerKind, Language, ParsedArguments};
-use crate::compiler::{Cacheable, CompileCommand, CompilerArguments};
+use crate::compiler::{Cacheable, ColorMode, CompileCommand, CompilerArguments};
 use crate::dist;
 use crate::errors::*;
-use log::Level::Trace;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
+use crate::util::{run_input_output, OsStrExt};
+use log::Level::Trace;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
-use crate::util::{run_input_output, OsStrExt};
 
 #[derive(Clone, Debug)]
 pub struct Diab;
@@ -54,6 +54,7 @@ impl CCompilerImpl for Diab {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
+        _rewrite_includes_only: bool,
     ) -> SFuture<process::Output>
     where
         T: CommandCreatorSync,
@@ -68,6 +69,7 @@ impl CCompilerImpl for Diab {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        _rewrite_includes_only: bool,
     ) -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)> {
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars)
     }
@@ -259,6 +261,8 @@ where
         extra_hash_files: vec![],
         msvc_show_includes: false,
         profile_generate: false,
+        // FIXME: Implement me.
+        color_mode: ColorMode::Auto,
     })
 }
 
@@ -397,12 +401,11 @@ mod test {
         PathBuf, ARGS,
     };
     use crate::compiler::*;
-    use futures::Future;
     use crate::mock_command::*;
+    use crate::test::utils::*;
+    use futures::Future;
     use std::fs::File;
     use std::io::Write;
-    use tempdir::TempDir;
-    use crate::test::utils::*;
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -613,7 +616,10 @@ mod test {
 
     #[test]
     fn test_at_signs_file_not_readable() {
-        let td = TempDir::new("sccache").unwrap();
+        let td = tempfile::Builder::new()
+            .prefix("sccache")
+            .tempdir()
+            .unwrap();
         let arg = format!("-@{}", td.path().join("foo").display());
         // File foo doesn't exist.
         assert_eq!(
@@ -624,7 +630,10 @@ mod test {
 
     #[test]
     fn test_at_signs_file() {
-        let td = TempDir::new("sccache").unwrap();
+        let td = tempfile::Builder::new()
+            .prefix("sccache")
+            .tempdir()
+            .unwrap();
         File::create(td.path().join("foo"))
             .unwrap()
             .write_all(b"-c foo.c -o foo.o")
@@ -667,6 +676,7 @@ mod test {
             extra_hash_files: vec![],
             msvc_show_includes: false,
             profile_generate: false,
+            color_mode: ColorMode::Auto,
         };
         let compiler = &f.bins[0];
         // Compiler invocation.

@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::mock_command::{CommandChild, RunCommand};
+use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
 use futures::{future, Future};
 use futures_cpupool::CpuPool;
-use crate::mock_command::{CommandChild, RunCommand};
-use ring::digest::{Context, SHA512};
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::Hasher;
-use std::io::BufReader;
 use std::io::prelude::*;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::time;
@@ -32,17 +32,17 @@ use crate::errors::*;
 
 #[derive(Clone)]
 pub struct Digest {
-    inner: Context,
+    inner: blake3_Hasher,
 }
 
 impl Digest {
     pub fn new() -> Digest {
         Digest {
-            inner: Context::new(&SHA512),
+            inner: blake3_Hasher::new(),
         }
     }
 
-    /// Calculate the SHA-512 digest of the contents of `path`, running
+    /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
     pub fn file<T>(path: T, pool: &CpuPool) -> SFuture<String>
     where
@@ -51,20 +51,30 @@ impl Digest {
         Self::reader(path.as_ref().to_owned(), pool)
     }
 
+    /// Calculate the BLAKE3 digest of the contents read from `reader`.
+    pub fn reader_sync<R: Read>(reader: R) -> Result<String> {
+        let mut m = Digest::new();
+        let mut reader = BufReader::new(reader);
+        loop {
+            // A buffer of 128KB should give us the best performance.
+            // See https://eklitzke.org/efficient-file-copying-on-linux.
+            let mut buffer = [0; 128 * 1024];
+            let count = reader.read(&mut buffer[..])?;
+            if count == 0 {
+                break;
+            }
+            m.update(&buffer[..count]);
+        }
+        Ok(m.finish())
+    }
+
+    /// Calculate the BLAKE3 digest of the contents of `path`, running
+    /// the actual hash computation on a background thread in `pool`.
     pub fn reader(path: PathBuf, pool: &CpuPool) -> SFuture<String> {
         Box::new(pool.spawn_fn(move || -> Result<_> {
-            let rdr = File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
-            let mut m = Digest::new();
-            let mut reader = BufReader::new(rdr);
-            loop {
-                let mut buffer = [0; 1024];
-                let count = reader.read(&mut buffer[..])?;
-                if count == 0 {
-                    break;
-                }
-                m.update(&buffer[..count]);
-            }
-            Ok(m.finish())
+            let reader = File::open(&path)
+                .chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
+            Digest::reader_sync(reader)
         }))
     }
 
@@ -73,7 +83,13 @@ impl Digest {
     }
 
     pub fn finish(self) -> String {
-        hex(self.inner.finish().as_ref())
+        hex(self.inner.finalize().as_bytes())
+    }
+}
+
+impl Default for Digest {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -93,8 +109,8 @@ pub fn hex(bytes: &[u8]) -> String {
     }
 }
 
-/// Calculate the SHA-1 digest of each file in `files` on background threads
-/// in `pool`.
+/// Calculate the digest of each file in `files` on background threads in
+/// `pool`.
 pub fn hash_all(files: &[PathBuf], pool: &CpuPool) -> SFuture<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
@@ -102,10 +118,11 @@ pub fn hash_all(files: &[PathBuf], pool: &CpuPool) -> SFuture<Vec<String>> {
     Box::new(
         future::join_all(
             files
-                .into_iter()
+                .iter()
                 .map(move |f| Digest::file(f, &pool))
                 .collect::<Vec<_>>(),
-        ).map(move |hashes| {
+        )
+        .map(move |hashes| {
             trace!(
                 "Hashed {} files in {}",
                 count,
@@ -118,11 +135,7 @@ pub fn hash_all(files: &[PathBuf], pool: &CpuPool) -> SFuture<Vec<String>> {
 
 /// Format `duration` as seconds with a fractional component.
 pub fn fmt_duration_as_secs(duration: &Duration) -> String {
-    format!(
-        "{}.{:03} s",
-        duration.as_secs(),
-        duration.subsec_nanos() / 1000_000
-    )
+    format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
 }
 
 /// If `input`, write it to `child`'s stdin while also reading `child`'s stdout and stderr, then wait on `child` and return its status and output.
@@ -156,7 +169,7 @@ where
         let stdout = out.map(|p| p.1);
         let stderr = err.map(|p| p.1);
         process::Output {
-            status: status,
+            status,
             stdout: stdout.unwrap_or_default(),
             stderr: stderr.unwrap_or_default(),
         }
@@ -177,7 +190,8 @@ where
             Stdio::piped()
         } else {
             Stdio::inherit()
-        }).stdout(Stdio::piped())
+        })
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
 
@@ -495,15 +509,15 @@ pub fn daemonize() -> Result<()> {
         }
 
         unsafe {
-            drop(writeln!(Stderr, "signal {} received", signum));
+            let _ = writeln!(Stderr, "signal {} received", signum);
 
             // Configure the old handler and then resume the program. This'll
             // likely go on to create a runtime dump if one's configured to be
             // created.
             match signum {
-                libc::SIGBUS => libc::sigaction(signum, &*PREV_SIGBUS, 0 as *mut _),
-                libc::SIGILL => libc::sigaction(signum, &*PREV_SIGILL, 0 as *mut _),
-                _ => libc::sigaction(signum, &*PREV_SIGSEGV, 0 as *mut _),
+                libc::SIGBUS => libc::sigaction(signum, &*PREV_SIGBUS, std::ptr::null_mut()),
+                libc::SIGILL => libc::sigaction(signum, &*PREV_SIGILL, std::ptr::null_mut()),
+                _ => libc::sigaction(signum, &*PREV_SIGSEGV, std::ptr::null_mut()),
             };
         }
     }

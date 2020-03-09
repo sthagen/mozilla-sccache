@@ -12,18 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use atty::Stream;
-use byteorder::{BigEndian, ByteOrder};
 use crate::client::{connect_to_server, connect_with_retry, ServerConnection};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
 use crate::config::Config;
-use futures::Future;
 use crate::jobserver::Client;
-use log::Level::Trace;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
-use crate::server::{self, ServerInfo, DistInfo, ServerStartup};
+use crate::server::{self, DistInfo, ServerInfo, ServerStartup};
+use crate::util::daemonize;
+use atty::Stream;
+use byteorder::{BigEndian, ByteOrder};
+use futures::Future;
+use log::Level::Trace;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -37,7 +38,6 @@ use tokio::runtime::current_thread::Runtime;
 use tokio_io::io::read_exact;
 use tokio_io::AsyncRead;
 use tokio_timer::Timeout;
-use crate::util::daemonize;
 use which::which_in;
 
 use crate::errors::*;
@@ -46,7 +46,7 @@ use crate::errors::*;
 pub const DEFAULT_PORT: u16 = 4226;
 
 /// The number of milliseconds to wait for server startup.
-const SERVER_STARTUP_TIMEOUT_MS: u32 = 5000;
+const SERVER_STARTUP_TIMEOUT_MS: u32 = 10000;
 
 /// Get the port on which the server should listen.
 fn get_port() -> u16 {
@@ -77,10 +77,9 @@ fn read_server_startup_status<R: AsyncRead>(
 fn run_server_process() -> Result<ServerStartup> {
     use futures::Stream;
     use std::time::Duration;
-    use tempdir::TempDir;
 
     trace!("run_server_process");
-    let tempdir = TempDir::new("sccache")?;
+    let tempdir = tempfile::Builder::new().prefix("sccache").tempdir()?;
     let socket_path = tempdir.path().join("sock");
     let mut runtime = Runtime::new()?;
     let listener = tokio_uds::UnixListener::bind(&socket_path)?;
@@ -102,7 +101,7 @@ fn run_server_process() -> Result<ServerStartup> {
         if err.is_elapsed() {
             Ok(ServerStartup::TimedOut)
         } else if err.is_inner() {
-            Err(err.into_inner().unwrap().into())
+            Err(err.into_inner().unwrap())
         } else {
             Err(err.into_timer().unwrap().into())
         }
@@ -155,11 +154,11 @@ fn run_server_process() -> Result<ServerStartup> {
     use tokio_named_pipes::NamedPipe;
     use uuid::Uuid;
     use winapi::shared::minwindef::{DWORD, FALSE, LPVOID, TRUE};
+    use winapi::um::handleapi::CloseHandle;
     use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
     use winapi::um::winbase::{
         CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
     };
-    use winapi::um::handleapi::CloseHandle;
 
     trace!("run_server_process");
 
@@ -167,7 +166,7 @@ fn run_server_process() -> Result<ServerStartup> {
     let mut runtime = Runtime::new()?;
     let pipe_name = format!(r"\\.\pipe\{}", Uuid::new_v4().to_simple_ref());
     let server = runtime.block_on(future::lazy(|| {
-        NamedPipe::new(&pipe_name, &Handle::current())
+        NamedPipe::new(&pipe_name, &Handle::default())
     }))?;
 
     // Connect a client to our server, and we'll wait below if it's still in
@@ -224,7 +223,10 @@ fn run_server_process() -> Result<ServerStartup> {
             ptr::null_mut(),
             ptr::null_mut(),
             FALSE,
-            CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            CREATE_UNICODE_ENVIRONMENT
+                | DETACHED_PROCESS
+                | CREATE_NEW_PROCESS_GROUP
+                | CREATE_NO_WINDOW,
             envp.as_mut_ptr() as LPVOID,
             ptr::null(),
             &mut si,
@@ -331,7 +333,7 @@ pub fn request_shutdown(mut conn: ServerConnection) -> Result<ServerInfo> {
 fn request_compile<W, X, Y>(
     conn: &mut ServerConnection,
     exe: W,
-    args: &Vec<X>,
+    args: &[X],
     cwd: Y,
     env_vars: Vec<(OsString, OsString)>,
 ) -> Result<CompileResponse>
@@ -344,7 +346,7 @@ where
         exe: exe.as_ref().to_owned().into(),
         cwd: cwd.as_ref().to_owned().into(),
         args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
-        env_vars: env_vars,
+        env_vars,
     });
     trace!("request_compile: {:?}", req);
     //TODO: better error mapping?
@@ -438,6 +440,7 @@ fn handle_compile_finished(
 ///
 /// If the server returned `UnhandledCompile`, run the compilation command
 /// locally using `creator` and return the result.
+#[allow(clippy::too_many_arguments)]
 fn handle_compile_response<T>(
     mut creator: T,
     runtime: &mut Runtime,
@@ -462,11 +465,10 @@ where
                 }
                 Ok(_) => bail!("unexpected response from server"),
                 Err(Error(ErrorKind::Io(ref e), _)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    writeln!(
-                        io::stderr(),
+                    eprintln!(
                         "warning: sccache server looks like it shut down \
                          unexpectedly, compiling locally instead"
-                    ).unwrap();
+                    );
                 }
                 Err(e) => {
                     return Err(e).chain_err(|| {
@@ -490,21 +492,18 @@ where
     if log_enabled!(Trace) {
         trace!("running command: {:?}", cmd);
     }
-    match runtime.block_on(
+    let status = runtime.block_on(
         cmd.spawn()
             .and_then(|c| c.wait().chain_err(|| "failed to wait for child")),
-    ) {
-        Ok(status) => {
-            Ok(status.code().unwrap_or_else(|| {
-                if let Some(sig) = status_signal(status) {
-                    println!("Compile terminated by signal {}", sig);
-                }
-                // Arbitrary.
-                2
-            }))
+    )?;
+
+    Ok(status.code().unwrap_or_else(|| {
+        if let Some(sig) = status_signal(status) {
+            println!("Compile terminated by signal {}", sig);
         }
-        Err(e) => Err(e),
-    }
+        // Arbitrary.
+        2
+    }))
 }
 
 /// Send a `Compile` request to the sccache server `conn`, and handle the response.
@@ -512,6 +511,7 @@ where
 /// The first entry in `cmdline` will be looked up in `path` if it is not
 /// an absolute path.
 /// See `request_compile` and `handle_compile_response`.
+#[allow(clippy::too_many_arguments)]
 pub fn do_compile<T>(
     creator: T,
     runtime: &mut Runtime,
@@ -614,7 +614,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     cached_config
                         .with_mut(|c| {
                             c.dist.auth_tokens.insert(auth_url.to_owned(), token);
-                        }).chain_err(|| "Unable to save auth token")?;
+                        })
+                        .chain_err(|| "Unable to save auth token")?;
                     println!("Saved token")
                 }
                 config::DistAuth::Oauth2Implicit {
@@ -631,7 +632,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     cached_config
                         .with_mut(|c| {
                             c.dist.auth_tokens.insert(auth_url.to_owned(), token);
-                        }).chain_err(|| "Unable to save auth token")?;
+                        })
+                        .chain_err(|| "Unable to save auth token")?;
                     println!("Saved token")
                 }
             };
@@ -643,9 +645,10 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::DistStatus => {
             trace!("Command::DistStatus");
             let srv = connect_or_start_server(get_port())?;
-            let status = request_dist_status(srv).chain_err(|| "failed to get dist-status from server")?;
+            let status =
+                request_dist_status(srv).chain_err(|| "failed to get dist-status from server")?;
             serde_json::to_writer(&mut io::stdout(), &status)?;
-        },
+        }
         #[cfg(feature = "dist-client")]
         Command::PackageToolchain(executable, out) => {
             use crate::compiler;
@@ -659,7 +662,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             let pool = CpuPool::new(1);
             let out_file = File::create(out)?;
 
-            let compiler = compiler::get_compiler_info(&creator, &executable, &env, &pool);
+            let compiler = compiler::get_compiler_info(&creator, &executable, &env, &pool, None);
             let packager = compiler.map(|c| c.get_toolchain_packager());
             let res = packager.and_then(|p| p.write_pkg(out_file));
             runtime.block_on(res)?

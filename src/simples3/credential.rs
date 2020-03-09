@@ -52,8 +52,8 @@ impl AwsCredentials {
         AwsCredentials {
             key: key.into(),
             secret: secret.into(),
-            token: token,
-            expires_at: expires_at,
+            token,
+            expires_at,
         }
     }
 
@@ -203,7 +203,7 @@ impl ProvideAwsCredentials for ProfileProvider {
         let result = result.and_then(|mut profiles| {
             profiles
                 .remove(self.profile())
-                .ok_or("profile not found".into())
+                .ok_or_else(|| "profile not found".into())
         });
         Box::new(future::result(result))
     }
@@ -234,14 +234,11 @@ fn parse_credentials_file(file_path: &Path) -> Result<HashMap<String, AwsCredent
 
         // handle the opening of named profile blocks
         if profile_regex.is_match(&unwrapped_line) {
-            if profile_name.is_some() && access_key.is_some() && secret_key.is_some() {
-                let creds = AwsCredentials::new(
-                    access_key.unwrap(),
-                    secret_key.unwrap(),
-                    None,
-                    in_ten_minutes(),
-                );
-                profiles.insert(profile_name.unwrap(), creds);
+            if let (Some(profile_name), Some(access_key), Some(secret_key)) =
+                (profile_name, access_key, secret_key)
+            {
+                let creds = AwsCredentials::new(access_key, secret_key, None, in_ten_minutes());
+                profiles.insert(profile_name, creds);
             }
 
             access_key = None;
@@ -270,14 +267,11 @@ fn parse_credentials_file(file_path: &Path) -> Result<HashMap<String, AwsCredent
         // we could potentially explode here to indicate that the file is invalid
     }
 
-    if profile_name.is_some() && access_key.is_some() && secret_key.is_some() {
-        let creds = AwsCredentials::new(
-            access_key.unwrap(),
-            secret_key.unwrap(),
-            None,
-            in_ten_minutes(),
-        );
-        profiles.insert(profile_name.unwrap(), creds);
+    if let (Some(profile_name), Some(access_key), Some(secret_key)) =
+        (profile_name, access_key, secret_key)
+    {
+        let creds = AwsCredentials::new(access_key, secret_key, None, in_ten_minutes());
+        profiles.insert(profile_name, creds);
     }
 
     if profiles.is_empty() {
@@ -319,7 +313,8 @@ impl IamProvider {
                     let bytes = res.chain_err(|| "couldn't connect to metadata service")?;
                     String::from_utf8(bytes)
                         .chain_err(|| "Didn't get a parsable response body from metadata service")
-                }).map(move |body| {
+                })
+                .map(move |body| {
                     let mut address = address.to_string();
                     address.push_str(&body);
                     address
@@ -356,10 +351,11 @@ impl ProvideAwsCredentials for IamProvider {
                 .fold(Vec::new(), |mut body, chunk| {
                     body.extend_from_slice(&chunk);
                     Ok::<_, hyper::Error>(body)
-                }).chain_err(|| "failed to read http body")
+                })
+                .chain_err(|| "failed to read http body")
         });
         let body = body
-            .map_err(|_e| "Didn't get a parseable response body from instance role details".into())
+            .map_err(|e| format!("Failed to get IAM credentials: {}", e).into())
             .and_then(|body| {
                 String::from_utf8(body).chain_err(|| "failed to read iam role response")
             });
@@ -512,7 +508,8 @@ impl ProvideAwsCredentials for ChainProvider {
                         debug!("Using AWS credentials from IAM");
                         c
                     })
-                }).map_err(|_| {
+                })
+                .map_err(|_| {
                     "Couldn't find AWS credentials in environment, credentials file, or IAM role."
                         .into()
                 }),
@@ -530,9 +527,7 @@ impl ChainProvider {
 
     /// Create a new `ChainProvider` using the provided `ProfileProvider`s.
     pub fn with_profile_providers(profile_providers: Vec<ProfileProvider>) -> ChainProvider {
-        ChainProvider {
-            profile_providers: profile_providers,
-        }
+        ChainProvider { profile_providers }
     }
 }
 

@@ -36,14 +36,16 @@ Table of Contents (ToC)
 Build Requirements
 ------------------
 
-Sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus `rustc`). sccache currently requires **Rust 1.31.1**.
+Sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus `rustc`). sccache currently requires **Rust 1.36.0**.
 
 We recommend you install Rust via [Rustup](https://rustup.rs/). The generated binaries can be built so that they are very [portable](#building-portable-binaries). By default `sccache` supports a local disk cache. To build `sccache` with support for `S3` and/or `Redis` cache backends, add `--features=all` or select a specific feature by passing `s3`, `gcs`, and/or `redis`. Refer the [Cargo Documentation](http://doc.crates.io/manifest.html#the-features-section) for details.
 
 Build
 -----
 
-> $ cargo build [--features=all|redis|s3|gcs] [--release]
+```bash
+cargo build [--features=all|redis|s3|gcs] [--release]
+```
 
 ### Building portable binaries
 
@@ -53,7 +55,7 @@ When building with the `gcs` feature, `sccache` will depend on OpenSSL, which ca
 
 You will need to download and build OpenSSL with `-fPIC` in order to statically link against it.
 
-```
+```bash
 ./config -fPIC --prefix=/usr/local --openssldir=/usr/local/ssl
 make
 make install
@@ -68,7 +70,7 @@ Build with `cargo` and use `ldd` to check that the resulting binary does not dep
 
 Just setting the below environment variable will enable static linking.
 
-```
+```bash
 export OPENSSL_STATIC=yes
 ```
 
@@ -76,11 +78,11 @@ Build with `cargo` and use `otool -L` to check that the resulting binary does no
 
 #### Windows
 
-On Windows it is fairly straight forward to just ship the required `libcrpyto` and `libssl` DLLs with `sccache.exe`, but the binary might also depend on a few MSVC CRT DLLs that are not available on older Windows versions.
+On Windows it is fairly straight forward to just ship the required `libcrypto` and `libssl` DLLs with `sccache.exe`, but the binary might also depend on a few MSVC CRT DLLs that are not available on older Windows versions.
 
 It is possible to statically link against the CRT using a `.cargo/config` file with the following contents.
 
-```
+```toml
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static"]
 ```
@@ -105,13 +107,25 @@ set OPENSSL_LIBS=libcrypto64MT:libssl64MT
 
 ### With Rust
 
-`$ cargo install sccache`
+```bash
+cargo install sccache
+```
+
+### macOS
+
+sccache can also be installed via [Homebrew](https://brew.sh/)
+
+```
+brew install sccache
+```
 
 ### Windows
 
 sccache can also be installed via [scoop](https://scoop.sh/)
 
-`> scoop install sccache`
+```
+scoop install sccache
+```
 
 ---
 
@@ -120,11 +134,27 @@ Usage
 
 Running sccache is like running ccache: wrap your compilation commands with it, like so:
 
-> $ sccache gcc -o foo.o -c foo.c
+```bash
+sccache gcc -o foo.o -c foo.c
+```
 
-or use it with rust, like so:
+If you want to use sccache for your rust builds you can define `build.rustc-wrapper` in the
+[cargo configuration file](https://doc.rust-lang.org/cargo/reference/config.html).  For example, you can set it globally
+in `$HOME/.cargo/config` by adding:
 
-> $ RUSTC_WRAPPER=[path to sccache] cargo build
+```toml
+[build]
+rustc-wrapper = "/path/to/sccache"
+```
+
+Note that you need to use cargo 1.40 or newer for this to work.  (In cargo 1.40 you will see a warning about this
+configuration not being used.  This is a false positive.  The warning will go away in future releases.)
+
+Alternatively you can use the environment variable `RUSTC_WRAPPER`:
+
+```bash
+RUSTC_WRAPPER=/path/to/sccache cargo build
+```
 
 Sccache (tries to) support gcc, clang, [diab](https://www.windriver.com/products/development-tools/#diab_compiler) and MSVC. If you don't [specify otherwise](#storage-options), sccache will use a local disk cache.
 
@@ -142,14 +172,14 @@ Storage Options
 ---------------
 
 ### Local
-Sccache defaults to using local disk storage. You can set the `SCCACHE_DIR` environment variable to change the disk cache location. By default it will use a sensible location for the current platform: `~/.cache/sccache` on Linux, `%LOCALAPPDATA%\Mozilla\sccache` on Windows, and `~/Library/Caches/Mozilla.sccache` on MacOS.
+Sccache defaults to using local disk storage. You can set the `SCCACHE_DIR` environment variable to change the disk cache location. By default it will use a sensible location for the current platform: `~/.cache/sccache` on Linux, `%LOCALAPPDATA%\Mozilla\sccache` on Windows, and `~/Library/Caches/Mozilla.sccache` on MacOS. To limit the cache size set `SCCACHE_CACHE_SIZE`, for example `SCCACHE_CACHE_SIZE="1G"`. The default value is 10 Gigabytes.
 
 ### S3
 If you want to use S3 storage for the sccache cache, you need to set the `SCCACHE_BUCKET` environment variable to the name of the S3 bucket to use.
 
 You can use `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to set the S3 credentials.  Alternately, you can set `AWS_IAM_CREDENTIALS_URL` to a URL that returns credentials in the format supported by the [EC2 metadata service](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#instance-metadata-security-credentials), and credentials will be fetched from that location as needed. In the absence of either of these options, credentials for the instance's IAM role will be fetched from the EC2 metadata service directly.
 
-If you need to override the default endpoint you can set `SCCACHE_ENDPOINT`. To connect to a minio storage for example you can set `SCCACHE_ENDPOINT=<ip>:<port>`. 
+If you need to override the default endpoint you can set `SCCACHE_ENDPOINT`. To connect to a minio storage for example you can set `SCCACHE_ENDPOINT=<ip>:<port>`. If your endpoint requires TLS, set `SCCACHE_S3_USE_SSL=true`.
 
 
 ### Redis

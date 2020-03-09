@@ -1,11 +1,11 @@
 use error_chain::ChainedError;
-use futures::sync::oneshot;
-use futures::prelude::*;
 use futures::future;
+use futures::prelude::*;
+use futures::sync::oneshot;
 use http::StatusCode;
 use hyper::body::Payload;
-use hyper::server::conn::{AddrIncoming};
-use hyper::service::{Service};
+use hyper::server::conn::AddrIncoming;
+use hyper::service::Service;
 use hyper::{Body, Request, Response, Server};
 use hyperx::header::{ContentLength, ContentType};
 use serde::Serialize;
@@ -42,7 +42,8 @@ impl<T> ServeFn for T where
         + Copy
         + Send
         + 'static
-{}
+{
+}
 
 fn serve_sfuture(serve: fn(Request<Body>) -> SFutureSend<Response<Body>>) -> impl ServeFn {
     move |req: Request<Body>| {
@@ -127,11 +128,11 @@ mod code_grant_pkce {
         html_response, json_response, query_pairs, MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING,
         REDIRECT_WITH_AUTH_JSON,
     };
-    use crypto::digest::Digest;
     use futures::future;
     use futures::sync::oneshot;
     use hyper::{Body, Method, Request, Response, StatusCode};
     use rand::RngCore;
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::mpsc;
     use std::sync::Mutex;
@@ -172,7 +173,6 @@ mod code_grant_pkce {
     const TOKEN_TYPE_RESULT_PARAM_VALUE: &str = "bearer"; // case-insensitive
 
     const NUM_CODE_VERIFIER_BYTES: usize = 256 / 8;
-    type HASHER = crypto::sha2::Sha256;
 
     pub struct State {
         pub auth_url: String,
@@ -191,11 +191,9 @@ mod code_grant_pkce {
             rand::OsRng::new().chain_err(|| "Failed to initialise a random number generator")?;
         rng.fill_bytes(&mut code_verifier_bytes);
         let code_verifier = base64::encode_config(&code_verifier_bytes, base64::URL_SAFE_NO_PAD);
-        let mut hasher = HASHER::new();
-        hasher.input_str(&code_verifier);
-        let mut code_challenge_bytes = vec![0; hasher.output_bytes()];
-        hasher.result(&mut code_challenge_bytes);
-        let code_challenge = base64::encode_config(&code_challenge_bytes, base64::URL_SAFE_NO_PAD);
+        let mut hasher = Sha256::new();
+        hasher.input(&code_verifier);
+        let code_challenge = base64::encode_config(&hasher.result(), base64::URL_SAFE_NO_PAD);
         Ok((code_verifier, code_challenge))
     }
 
@@ -254,10 +252,8 @@ mod code_grant_pkce {
             (&Method::GET, "/auth_detail.json") => ftry_send!(json_response(&state.auth_url)),
             (&Method::GET, "/redirect") => {
                 let query_pairs = ftry_send!(query_pairs(&req.uri().to_string()));
-                let (code, auth_state) = ftry_send!(
-                    handle_code_response(query_pairs)
-                        .chain_err(|| "Failed to handle response from redirect")
-                );
+                let (code, auth_state) = ftry_send!(handle_code_response(query_pairs)
+                    .chain_err(|| "Failed to handle response from redirect"));
                 if auth_state != state.auth_state_value {
                     return ftry_send!(Err("Mismatched auth states after redirect"));
                 }
@@ -385,11 +381,12 @@ mod implicit {
             .get(EXPIRES_IN_RESULT_PARAM)
             .ok_or("No expiry found in response")?;
         // Calculate ASAP the actual time at which the token will expire
-        let expires_at = Instant::now() + Duration::from_secs(
-            expires_in
-                .parse()
-                .map_err(|_| "Failed to parse expiry as integer")?,
-        );
+        let expires_at = Instant::now()
+            + Duration::from_secs(
+                expires_in
+                    .parse()
+                    .map_err(|_| "Failed to parse expiry as integer")?,
+            );
         let state = params
             .get(STATE_RESULT_PARAM)
             .ok_or("No state found in response")?;
@@ -435,9 +432,9 @@ mod implicit {
             (&Method::GET, "/redirect") => html_response(SAVE_AUTH_AFTER_REDIRECT),
             (&Method::POST, "/save_auth") => {
                 let query_pairs = ftry_send!(query_pairs(&req.uri().to_string()));
-                let (token, expires_at, auth_state) = ftry_send!(
-                    handle_response(query_pairs).chain_err(|| "Failed to save auth after redirect")
-                );
+                let (token, expires_at, auth_state) =
+                    ftry_send!(handle_response(query_pairs)
+                        .chain_err(|| "Failed to save auth after redirect"));
                 if auth_state != state.auth_state_value {
                     return ftry_send!(Err("Mismatched auth states after redirect"));
                 }
@@ -489,7 +486,7 @@ impl<F, ReqBody, Ret, ResBody> Service for ServiceFn<F, ReqBody>
 where
     F: Fn(Request<ReqBody>) -> Ret,
     ReqBody: Payload,
-    Ret: IntoFuture<Item=Response<ResBody>>,
+    Ret: IntoFuture<Item = Response<ResBody>>,
     Ret::Error: Into<Box<dyn StdError + Send + Sync>>,
     ResBody: Payload,
 {
@@ -513,15 +510,9 @@ impl<F, R> IntoFuture for ServiceFn<F, R> {
     }
 }
 
-fn try_serve<T>(
-    serve: T,
-) -> Result<
-    Server<
-        AddrIncoming,
-        impl Fn() -> ServiceFn<T, Body>,
-    >,
->
-where T: ServeFn
+fn try_serve<T>(serve: T) -> Result<Server<AddrIncoming, impl Fn() -> ServiceFn<T, Body>>>
+where
+    T: ServeFn,
 {
     // Try all the valid ports
     for &port in VALID_PORTS {
@@ -546,12 +537,10 @@ where T: ServeFn
 
         let new_service = move || service_fn(serve);
         match Server::try_bind(&addr) {
-            Ok(s) => {
-                return Ok(s.serve(new_service))
-            }
+            Ok(s) => return Ok(s.serve(new_service)),
             Err(ref err)
                 if err
-                    .cause2()
+                    .source()
                     .and_then(|err| err.downcast_ref::<io::Error>())
                     .map(|err| err.kind() == io::ErrorKind::AddrInUse)
                     .unwrap_or(false) =>

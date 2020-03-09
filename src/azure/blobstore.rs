@@ -14,44 +14,39 @@
 // limitations under the License.
 
 use crate::azure::credentials::*;
-use crypto::digest::Digest;
-use crypto::hmac::Hmac;
-use crypto::mac::Mac;
-use crypto::md5::Md5;
-use crypto::sha2::Sha256;
 use futures::{Future, Stream};
-use hyper::Method;
+use hmac::{Hmac, Mac};
 use hyper::header::HeaderValue;
+use hyper::Method;
 use hyperx::header;
-use url::Url;
-use reqwest::r#async::{Request, Client};
+use md5::{Digest, Md5};
+use reqwest::r#async::{Client, Request};
+use sha2::Sha256;
 use std::fmt;
 use std::str::FromStr;
+use url::Url;
 
 use crate::errors::*;
 use crate::util::HeadersExt;
 
 const BLOB_API_VERSION: &str = "2017-04-17";
 
-fn hmac<D: Digest>(digest: D, data: &[u8], secret: &[u8]) -> Vec<u8> {
-    let mut hmac = Hmac::new(digest, secret);
+fn hmac(data: &[u8], secret: &[u8]) -> Vec<u8> {
+    let mut hmac = Hmac::<Sha256>::new_varkey(secret).expect("HMAC can take key of any size");
     hmac.input(data);
     hmac.result().code().iter().map(|b| *b).collect::<Vec<u8>>()
 }
 
 fn signature(to_sign: &str, secret: &str) -> String {
     let decoded_secret = base64::decode_config(secret.as_bytes(), base64::STANDARD).unwrap();
-    let sig = hmac(Sha256::new(), to_sign.as_bytes(), &decoded_secret);
+    let sig = hmac(to_sign.as_bytes(), &decoded_secret);
     base64::encode_config::<Vec<u8>>(&sig, base64::STANDARD)
 }
 
 fn md5(data: &[u8]) -> String {
-    let mut result: Vec<u8> = vec![0; 16]; // md5 digest is 16 bytes long.
     let mut digest = Md5::new();
     digest.input(data);
-    digest.result(&mut result);
-
-    base64::encode_config::<Vec<u8>>(&result, base64::STANDARD)
+    base64::encode_config(&digest.result(), base64::STANDARD)
 }
 
 pub struct BlobContainer {
@@ -69,7 +64,7 @@ impl BlobContainer {
     pub fn new(base_url: &str, container_name: &Option<String>) -> Result<BlobContainer> {
         let container_url = match container_name {
             &Some(ref name) => format!("{}{}/", base_url, name), // base_url is assumed to end in a trailing slash
-            &None           => base_url.to_owned()
+            &None => base_url.to_owned(),
         };
 
         Ok(BlobContainer {
@@ -87,48 +82,67 @@ impl BlobContainer {
 
         let auth = compute_auth_header(
             "GET",
-            "",    // content_length
-            "",    // content_md5
-            "",    // content_type
+            "", // content_length
+            "", // content_md5
+            "", // content_type
             &canonical_headers,
             &uri,
-            creds);
+            creds,
+        );
 
         let uri_copy = uri.clone();
         let uri_second_copy = uri.clone();
 
         let mut request = Request::new(Method::GET, uri);
-        request.headers_mut().insert("x-ms-date", HeaderValue::from_str(&date).expect("Date is an invalid header value"));
-        request.headers_mut().insert("x-ms-version", HeaderValue::from_static(BLOB_API_VERSION));
-        request.headers_mut().insert("Authorization", HeaderValue::from_str(&auth).expect("Authorization is an invalid header value"));
+        request.headers_mut().insert(
+            "x-ms-date",
+            HeaderValue::from_str(&date).expect("Date is an invalid header value"),
+        );
+        request
+            .headers_mut()
+            .insert("x-ms-version", HeaderValue::from_static(BLOB_API_VERSION));
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&auth).expect("Authorization is an invalid header value"),
+        );
 
-        Box::new(self.client.execute(request).chain_err(move || {
-            format!("failed GET: {}", uri_copy)
-        }).and_then(|res| {
-            if res.status().is_success() {
-                let content_length = res.headers().get_hyperx::<header::ContentLength>()
-                    .map(|header::ContentLength(len)| len);
-                Ok((res.into_body(), content_length))
-            } else {
-                Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
-            }
-        }).and_then(|(body, content_length)| {
-            body.fold(Vec::new(), |mut body, chunk| {
-                body.extend_from_slice(&chunk);
-                Ok::<_, reqwest::Error>(body)
-            }).chain_err(|| {
-                "failed to read HTTP body"
-            }).and_then(move |bytes| {
-                if let Some(len) = content_length {
-                    if len != bytes.len() as u64 {
-                        bail!(format!("Bad HTTP body size read: {}, expected {}", bytes.len(), len));
+        Box::new(
+            self.client
+                .execute(request)
+                .chain_err(move || format!("failed GET: {}", uri_copy))
+                .and_then(|res| {
+                    if res.status().is_success() {
+                        let content_length = res
+                            .headers()
+                            .get_hyperx::<header::ContentLength>()
+                            .map(|header::ContentLength(len)| len);
+                        Ok((res.into_body(), content_length))
                     } else {
-                        info!("Read {} bytes from {}", bytes.len(), uri_second_copy);
+                        Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
                     }
-                }
-                Ok(bytes)
-            })
-        }))
+                })
+                .and_then(|(body, content_length)| {
+                    body.fold(Vec::new(), |mut body, chunk| {
+                        body.extend_from_slice(&chunk);
+                        Ok::<_, reqwest::Error>(body)
+                    })
+                    .chain_err(|| "failed to read HTTP body")
+                    .and_then(move |bytes| {
+                        if let Some(len) = content_length {
+                            if len != bytes.len() as u64 {
+                                bail!(format!(
+                                    "Bad HTTP body size read: {}, expected {}",
+                                    bytes.len(),
+                                    len
+                                ));
+                            } else {
+                                info!("Read {} bytes from {}", bytes.len(), uri_second_copy);
+                            }
+                        }
+                        Ok(bytes)
+                    })
+                }),
+        )
     }
 
     pub fn put(&self, key: &str, content: Vec<u8>, creds: &AzureCredentials) -> SFuture<()> {
@@ -144,7 +158,10 @@ impl BlobContainer {
             format!("{}", content.len())
         };
 
-        let canonical_headers = format!("x-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:{}\n", date, BLOB_API_VERSION);
+        let canonical_headers = format!(
+            "x-ms-blob-type:BlockBlob\nx-ms-date:{}\nx-ms-version:{}\n",
+            date, BLOB_API_VERSION
+        );
 
         let auth = compute_auth_header(
             "PUT",
@@ -153,42 +170,64 @@ impl BlobContainer {
             content_type,
             &canonical_headers,
             &uri,
-            creds);
+            creds,
+        );
 
         let mut request = Request::new(Method::PUT, uri);
-        request.headers_mut().set(header::ContentType(content_type.parse().unwrap()));
-        request.headers_mut().set(header::ContentLength(content.len() as u64));
-        request.headers_mut().insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
-        request.headers_mut().insert("x-ms-date", HeaderValue::from_str(&date).expect("Invalid x-ms-date header"));
-        request.headers_mut().insert("x-ms-version", HeaderValue::from_static(BLOB_API_VERSION));
-        request.headers_mut().insert("Authorization", HeaderValue::from_str(&auth).expect("Invalid Authorization header"));
-        request.headers_mut().insert("Content-MD5", HeaderValue::from_str(&content_md5).expect("Invalid Content-MD5 header"));
+        request
+            .headers_mut()
+            .set(header::ContentType(content_type.parse().unwrap()));
+        request
+            .headers_mut()
+            .set(header::ContentLength(content.len() as u64));
+        request
+            .headers_mut()
+            .insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
+        request.headers_mut().insert(
+            "x-ms-date",
+            HeaderValue::from_str(&date).expect("Invalid x-ms-date header"),
+        );
+        request
+            .headers_mut()
+            .insert("x-ms-version", HeaderValue::from_static(BLOB_API_VERSION));
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&auth).expect("Invalid Authorization header"),
+        );
+        request.headers_mut().insert(
+            "Content-MD5",
+            HeaderValue::from_str(&content_md5).expect("Invalid Content-MD5 header"),
+        );
 
         *request.body_mut() = Some(content.into());
 
-        Box::new(self.client.execute(request).then(|result| {
-            match result {
-                Ok(res) => {
-                    if res.status().is_success() {
-                        trace!("PUT succeeded");
-                        Ok(())
-                    } else {
-                        trace!("PUT failed with HTTP status: {}", res.status());
-                        Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
-                    }
+        Box::new(self.client.execute(request).then(|result| match result {
+            Ok(res) => {
+                if res.status().is_success() {
+                    trace!("PUT succeeded");
+                    Ok(())
+                } else {
+                    trace!("PUT failed with HTTP status: {}", res.status());
+                    Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
                 }
-                Err(e) => {
-                    trace!("PUT failed with error: {:?}", e);
-                    Err(e.into())
-                }
+            }
+            Err(e) => {
+                trace!("PUT failed with error: {:?}", e);
+                Err(e.into())
             }
         }))
     }
 }
 
-fn compute_auth_header(verb: &str, content_length: &str, md5: &str,
-                       content_type: &str, canonical_headers: &str,
-                       uri: &Url, creds: &AzureCredentials) -> String {
+fn compute_auth_header(
+    verb: &str,
+    content_length: &str,
+    md5: &str,
+    content_type: &str,
+    canonical_headers: &str,
+    uri: &Url,
+    creds: &AzureCredentials,
+) -> String {
     /*
     Signature format taken from MSDN docs:
     https://docs.microsoft.com/en-us/azure/storage/common/storage-rest-api-auth
@@ -220,7 +259,11 @@ fn compute_auth_header(verb: &str, content_length: &str, md5: &str,
                 headers = canonical_headers,
                 resource = canonical_resource);
 
-    format!("SharedKey {}:{}", creds.azure_account_name(), signature(&string_to_sign, creds.azure_account_key()))
+    format!(
+        "SharedKey {}:{}",
+        creds.azure_account_name(),
+        signature(&string_to_sign, creds.azure_account_key())
+    )
 }
 
 fn canonicalize_resource(uri: &Url, account_name: &str) -> String {
@@ -283,7 +326,12 @@ mod test {
         let client_key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
         let container_name = Some("sccache".to_owned());
-        let creds = AzureCredentials::new(&blob_endpoint, &client_name, &client_key, container_name.clone());
+        let creds = AzureCredentials::new(
+            &blob_endpoint,
+            &client_name,
+            &client_key,
+            container_name.clone(),
+        );
 
         let mut runtime = Runtime::new().unwrap();
 
