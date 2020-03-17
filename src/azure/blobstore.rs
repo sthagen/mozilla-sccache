@@ -34,7 +34,7 @@ const BLOB_API_VERSION: &str = "2017-04-17";
 fn hmac(data: &[u8], secret: &[u8]) -> Vec<u8> {
     let mut hmac = Hmac::<Sha256>::new_varkey(secret).expect("HMAC can take key of any size");
     hmac.input(data);
-    hmac.result().code().iter().map(|b| *b).collect::<Vec<u8>>()
+    hmac.result().code().iter().copied().collect::<Vec<u8>>()
 }
 
 fn signature(to_sign: &str, secret: &str) -> String {
@@ -100,10 +100,12 @@ impl BlobContainer {
         request
             .headers_mut()
             .insert("x-ms-version", HeaderValue::from_static(BLOB_API_VERSION));
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&auth).expect("Authorization is an invalid header value"),
-        );
+        if let Some(auth) = auth {
+            request.headers_mut().insert(
+                "Authorization",
+                HeaderValue::from_str(&auth).expect("Authorization is an invalid header value"),
+            );
+        }
 
         Box::new(
             self.client
@@ -117,7 +119,7 @@ impl BlobContainer {
                             .map(|header::ContentLength(len)| len);
                         Ok((res.into_body(), content_length))
                     } else {
-                        Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
+                        Err(ErrorKind::BadHTTPStatus(res.status()).into())
                     }
                 })
                 .and_then(|(body, content_length)| {
@@ -189,10 +191,12 @@ impl BlobContainer {
         request
             .headers_mut()
             .insert("x-ms-version", HeaderValue::from_static(BLOB_API_VERSION));
-        request.headers_mut().insert(
-            "Authorization",
-            HeaderValue::from_str(&auth).expect("Invalid Authorization header"),
-        );
+        if let Some(auth) = auth {
+            request.headers_mut().insert(
+                "Authorization",
+                HeaderValue::from_str(&auth).expect("Invalid Authorization header"),
+            );
+        }
         request.headers_mut().insert(
             "Content-MD5",
             HeaderValue::from_str(&content_md5).expect("Invalid Content-MD5 header"),
@@ -207,7 +211,7 @@ impl BlobContainer {
                     Ok(())
                 } else {
                     trace!("PUT failed with HTTP status: {}", res.status());
-                    Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
+                    Err(ErrorKind::BadHTTPStatus(res.status()).into())
                 }
             }
             Err(e) => {
@@ -226,7 +230,7 @@ fn compute_auth_header(
     canonical_headers: &str,
     uri: &Url,
     creds: &AzureCredentials,
-) -> String {
+) -> Option<String> {
     /*
     Signature format taken from MSDN docs:
     https://docs.microsoft.com/en-us/azure/storage/common/storage-rest-api-auth
@@ -248,21 +252,21 @@ fn compute_auth_header(
            CanonicalizedHeaders + // CanonicalizedHeaders is defined to end with "\n"
            CanonicalizedResource;
     */
-
-    let canonical_resource = canonicalize_resource(uri, creds.azure_account_name());
-    let string_to_sign = format!("{verb}\n\n\n{length}\n{md5}\n{type}\n\n\n\n\n\n\n{headers}{resource}",
-                verb = verb,
-                length = content_length,
-                md5 = md5,
-                type = content_type,
-                headers = canonical_headers,
-                resource = canonical_resource);
-
-    format!(
-        "SharedKey {}:{}",
-        creds.azure_account_name(),
-        signature(&string_to_sign, creds.azure_account_key())
-    )
+    creds.azure_account_key().as_ref().map(|account_key| {
+        let canonical_resource = canonicalize_resource(uri, creds.azure_account_name());
+        let string_to_sign = format!("{verb}\n\n\n{length}\n{md5}\n{type}\n\n\n\n\n\n\n{headers}{resource}",
+                  verb = verb,
+                  length = content_length,
+                  md5 = md5,
+                  type = content_type,
+                  headers = canonical_headers,
+                  resource = canonical_resource);
+        format!(
+            "SharedKey {}:{}",
+            creds.azure_account_name(),
+            signature(&string_to_sign, &account_key)
+        )
+    })
 }
 
 fn canonicalize_resource(uri: &Url, account_name: &str) -> String {
@@ -322,13 +326,13 @@ mod test {
 
         let blob_endpoint = "http://localhost:10000/devstoreaccount1/";
         let client_name = "devstoreaccount1";
-        let client_key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let client_key = Some("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==".to_string());
 
         let container_name = "sccache";
         let creds = AzureCredentials::new(
             &blob_endpoint,
             &client_name,
-            &client_key,
+            client_key,
             container_name.to_string(),
         );
 
@@ -336,12 +340,12 @@ mod test {
 
         let container = BlobContainer::new(creds.azure_blob_endpoint(), container_name).unwrap();
 
-        let put_future = container.put("foo", "barbell".as_bytes().to_vec(), &creds);
+        let put_future = container.put("foo", b"barbell".to_vec(), &creds);
         runtime.block_on(put_future).unwrap();
 
         let get_future = container.get("foo", &creds);
         let result = runtime.block_on(get_future).unwrap();
 
-        assert_eq!("barbell".as_bytes().to_vec(), result);
+        assert_eq!(b"barbell".to_vec(), result);
     }
 }
