@@ -34,7 +34,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process;
 use strip_ansi_escapes::Writer;
-use tokio::runtime::current_thread::Runtime;
+use tokio_compat::runtime::current_thread::Runtime;
 use tokio_io::io::read_exact;
 use tokio_io::AsyncRead;
 use tokio_timer::Timeout;
@@ -150,7 +150,7 @@ fn run_server_process() -> Result<ServerStartup> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use std::time::Duration;
-    use tokio::reactor::Handle;
+    use tokio_reactor::Handle;
     use tokio_named_pipes::NamedPipe;
     use uuid::Uuid;
     use winapi::shared::minwindef::{DWORD, FALSE, LPVOID, TRUE};
@@ -166,7 +166,7 @@ fn run_server_process() -> Result<ServerStartup> {
     let mut runtime = Runtime::new()?;
     let pipe_name = format!(r"\\.\pipe\{}", Uuid::new_v4().to_simple_ref());
     let server = runtime.block_on(future::lazy(|| {
-        NamedPipe::new(&pipe_name, &Handle::default())
+        NamedPipe::new(&pipe_name, #[allow(deprecated)] &Handle::current())
     }))?;
 
     // Connect a client to our server, and we'll wait below if it's still in
