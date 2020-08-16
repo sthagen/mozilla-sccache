@@ -13,14 +13,12 @@
 // limitations under the License.
 
 #![deny(rust_2018_idioms)]
-#![recursion_limit = "128"]
+#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate clap;
 #[macro_use]
 extern crate counted_array;
-#[macro_use]
-extern crate error_chain;
 #[macro_use]
 extern crate futures;
 #[cfg(feature = "jsonwebtoken")]
@@ -62,7 +60,8 @@ mod simples3;
 pub mod util;
 
 use std::env;
-use std::io::Write;
+
+const LOGGING_ENV: &str = "SCCACHE_LOG";
 
 pub fn main() {
     init_logging();
@@ -70,19 +69,17 @@ pub fn main() {
         Ok(cmd) => match commands::run_command(cmd) {
             Ok(s) => s,
             Err(e) => {
-                let stderr = &mut std::io::stderr();
-                writeln!(stderr, "error: {}", e).unwrap();
-
-                for e in e.iter().skip(1) {
-                    writeln!(stderr, "caused by: {}", e).unwrap();
+                eprintln!("sccache: error: {}", e);
+                for e in e.chain().skip(1) {
+                    eprintln!("sccache: caused by: {}", e);
                 }
                 2
             }
         },
         Err(e) => {
             println!("sccache: {}", e);
-            for e in e.iter().skip(1) {
-                println!("caused by: {}", e);
+            for e in e.chain().skip(1) {
+                println!("sccache: caused by: {}", e);
             }
             cmdline::get_app().print_help().unwrap();
             println!();
@@ -92,8 +89,8 @@ pub fn main() {
 }
 
 fn init_logging() {
-    if env::var("RUST_LOG").is_ok() {
-        match env_logger::try_init() {
+    if env::var(LOGGING_ENV).is_ok() {
+        match env_logger::Builder::from_env(LOGGING_ENV).try_init() {
             Ok(_) => (),
             Err(e) => panic!(format!("Failed to initalize logging: {:?}", e)),
         }

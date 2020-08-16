@@ -16,19 +16,34 @@ use crate::mock_command::{CommandChild, RunCommand};
 use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
 use futures::{future, Future};
-use futures_cpupool::CpuPool;
+use futures_03::executor::ThreadPool;
+use futures_03::future::TryFutureExt;
+use futures_03::task;
 use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::prelude::*;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::time;
 use std::time::Duration;
 
 use crate::errors::*;
+
+pub trait SpawnExt: task::SpawnExt {
+    fn spawn_fn<F, T>(&self, f: F) -> SFuture<T>
+    where
+        F: FnOnce() -> Result<T> + std::marker::Send + 'static,
+        T: std::marker::Send + 'static,
+    {
+        self.spawn_with_handle(async move { f() })
+            .map(|f| Box::new(f.compat()) as _)
+            .unwrap_or_else(|e| f_err(e))
+    }
+}
+
+impl<S: task::SpawnExt + ?Sized> SpawnExt for S {}
 
 #[derive(Clone)]
 pub struct Digest {
@@ -44,7 +59,7 @@ impl Digest {
 
     /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
-    pub fn file<T>(path: T, pool: &CpuPool) -> SFuture<String>
+    pub fn file<T>(path: T, pool: &ThreadPool) -> SFuture<String>
     where
         T: AsRef<Path>,
     {
@@ -52,13 +67,12 @@ impl Digest {
     }
 
     /// Calculate the BLAKE3 digest of the contents read from `reader`.
-    pub fn reader_sync<R: Read>(reader: R) -> Result<String> {
+    pub fn reader_sync<R: Read>(mut reader: R) -> Result<String> {
         let mut m = Digest::new();
-        let mut reader = BufReader::new(reader);
+        // A buffer of 128KB should give us the best performance.
+        // See https://eklitzke.org/efficient-file-copying-on-linux.
+        let mut buffer = [0; 128 * 1024];
         loop {
-            // A buffer of 128KB should give us the best performance.
-            // See https://eklitzke.org/efficient-file-copying-on-linux.
-            let mut buffer = [0; 128 * 1024];
             let count = reader.read(&mut buffer[..])?;
             if count == 0 {
                 break;
@@ -70,10 +84,10 @@ impl Digest {
 
     /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
-    pub fn reader(path: PathBuf, pool: &CpuPool) -> SFuture<String> {
+    pub fn reader(path: PathBuf, pool: &ThreadPool) -> SFuture<String> {
         Box::new(pool.spawn_fn(move || -> Result<_> {
             let reader = File::open(&path)
-                .chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
+                .with_context(|| format!("Failed to open file for hashing: {:?}", path))?;
             Digest::reader_sync(reader)
         }))
     }
@@ -111,7 +125,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// Calculate the digest of each file in `files` on background threads in
 /// `pool`.
-pub fn hash_all(files: &[PathBuf], pool: &CpuPool) -> SFuture<Vec<String>> {
+pub fn hash_all(files: &[PathBuf], pool: &ThreadPool) -> SFuture<Vec<String>> {
     let start = time::Instant::now();
     let count = files.len();
     let pool = pool.clone();
@@ -150,19 +164,19 @@ where
     let stdin = input.and_then(|i| {
         child
             .take_stdin()
-            .map(|stdin| write_all(stdin, i).chain_err(|| "failed to write stdin"))
+            .map(|stdin| write_all(stdin, i).fcontext("failed to write stdin"))
     });
     let stdout = child
         .take_stdout()
-        .map(|io| read_to_end(io, Vec::new()).chain_err(|| "failed to read stdout"));
+        .map(|io| read_to_end(io, Vec::new()).fcontext("failed to read stdout"));
     let stderr = child
         .take_stderr()
-        .map(|io| read_to_end(io, Vec::new()).chain_err(|| "failed to read stderr"));
+        .map(|io| read_to_end(io, Vec::new()).fcontext("failed to read stderr"));
 
     // Finish writing stdin before waiting, because waiting drops stdin.
     let status = Future::and_then(stdin, |io| {
         drop(io);
-        child.wait().chain_err(|| "failed to wait for child")
+        child.wait().fcontext("failed to wait for child")
     });
 
     Box::new(status.join3(stdout, stderr).map(|(status, out, err)| {
@@ -178,9 +192,12 @@ where
 
 /// Run `command`, writing `input` to its stdin if it is `Some` and return the exit status and output.
 ///
-/// If the command returns a non-successful exit status, an error of `ErrorKind::ProcessError`
+/// If the command returns a non-successful exit status, an error of `SccacheError::ProcessError`
 /// will be returned containing the process output.
-pub fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>) -> SFuture<process::Output>
+pub fn run_input_output<C>(
+    mut command: C,
+    input: Option<Vec<u8>>,
+) -> impl Future<Item = process::Output, Error = Error>
 where
     C: RunCommand,
 {
@@ -195,15 +212,15 @@ where
         .stderr(Stdio::piped())
         .spawn();
 
-    Box::new(child.and_then(|child| {
+    child.and_then(|child| {
         wait_with_input_output(child, input).and_then(|output| {
             if output.status.success() {
                 f_ok(output)
             } else {
-                f_err(ErrorKind::ProcessError(output))
+                f_err(ProcessError(output))
             }
         })
-    }))
+    })
 }
 
 /// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
@@ -449,9 +466,7 @@ pub fn daemonize() -> Result<()> {
     match env::var("SCCACHE_NO_DAEMON") {
         Ok(ref val) if val == "1" => {}
         _ => {
-            Daemonize::new()
-                .start()
-                .chain_err(|| "failed to daemonize")?;
+            Daemonize::new().start().context("failed to daemonize")?;
         }
     }
 

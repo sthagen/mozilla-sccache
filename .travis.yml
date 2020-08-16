@@ -4,7 +4,10 @@ matrix:
   include:
     # OS compat
     - os: linux
+    # As of this writing, stable Rust (1.44.0) and the OS X version on TravisCI
+    # do not work well together.
     - os: osx
+      rust: 1.43.1
 
     # rustc version compat
     - rust: 1.41.1 # oldest supported version, keep in sync with README.md
@@ -29,6 +32,7 @@ matrix:
 
 before_script:
   - export EXTRA_FEATURES=
+  - if [[ "${TRAVIS_RUST_VERSION}" = "stable" ]]; then rustup component add rustfmt && cargo fmt -- --check; fi
   - if [[ "${TRAVIS_RUST_VERSION}" = "nightly" ]]; then export EXTRA_FEATURES="$EXTRA_FEATURES unstable"; fi
   - if [[ "${DIST_SCCACHE}" = "1" ]]; then export EXTRA_FEATURES="$EXTRA_FEATURES dist-client dist-server"; fi
 

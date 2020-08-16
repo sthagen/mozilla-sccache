@@ -150,8 +150,8 @@ fn run_server_process() -> Result<ServerStartup> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
     use std::time::Duration;
-    use tokio_reactor::Handle;
     use tokio_named_pipes::NamedPipe;
+    use tokio_reactor::Handle;
     use uuid::Uuid;
     use winapi::shared::minwindef::{DWORD, FALSE, LPVOID, TRUE};
     use winapi::um::handleapi::CloseHandle;
@@ -166,7 +166,11 @@ fn run_server_process() -> Result<ServerStartup> {
     let mut runtime = Runtime::new()?;
     let pipe_name = format!(r"\\.\pipe\{}", Uuid::new_v4().to_simple_ref());
     let server = runtime.block_on(future::lazy(|| {
-        NamedPipe::new(&pipe_name, #[allow(deprecated)] &Handle::current())
+        NamedPipe::new(
+            &pipe_name,
+            #[allow(deprecated)]
+            &Handle::current(),
+        )
     }))?;
 
     // Connect a client to our server, and we'll wait below if it's still in
@@ -267,8 +271,20 @@ fn connect_or_start_server(port: u16) -> Result<ServerConnection> {
         {
             // If the connection was refused we probably need to start
             // the server.
-            //TODO: check startup value!
-            let _startup = run_server_process()?;
+            match run_server_process()? {
+                ServerStartup::Ok { port: actualport } => {
+                    if port != actualport {
+                        // bail as the next connect_with_retry will fail
+                        bail!(
+                            "sccache: Listening on port {} instead of {}",
+                            actualport,
+                            port
+                        );
+                    }
+                }
+                ServerStartup::TimedOut => bail!("Timed out waiting for server startup"),
+                ServerStartup::Err { reason } => bail!("Server startup failed: {}", reason),
+            }
             let server = connect_with_retry(port)?;
             Ok(server)
         }
@@ -279,9 +295,9 @@ fn connect_or_start_server(port: u16) -> Result<ServerConnection> {
 /// Send a `ZeroStats` request to the server, and return the `ServerInfo` request if successful.
 pub fn request_zero_stats(mut conn: ServerConnection) -> Result<ServerInfo> {
     debug!("request_stats");
-    let response = conn.request(Request::ZeroStats).chain_err(|| {
-        "failed to send zero statistics command to server or failed to receive respone"
-    })?;
+    let response = conn
+        .request(Request::ZeroStats)
+        .context("failed to send zero statistics command to server or failed to receive respone")?;
     if let Response::Stats(stats) = response {
         Ok(*stats)
     } else {
@@ -294,7 +310,7 @@ pub fn request_stats(mut conn: ServerConnection) -> Result<ServerInfo> {
     debug!("request_stats");
     let response = conn
         .request(Request::GetStats)
-        .chain_err(|| "Failed to send data to or receive data from server")?;
+        .context("Failed to send data to or receive data from server")?;
     if let Response::Stats(stats) = response {
         Ok(*stats)
     } else {
@@ -307,7 +323,7 @@ pub fn request_dist_status(mut conn: ServerConnection) -> Result<DistInfo> {
     debug!("request_dist_status");
     let response = conn
         .request(Request::DistStatus)
-        .chain_err(|| "Failed to send data to or receive data from server")?;
+        .context("Failed to send data to or receive data from server")?;
     if let Response::DistStatus(info) = response {
         Ok(info)
     } else {
@@ -321,7 +337,7 @@ pub fn request_shutdown(mut conn: ServerConnection) -> Result<ServerInfo> {
     //TODO: better error mapping
     let response = conn
         .request(Request::Shutdown)
-        .chain_err(|| "Failed to send data to or receive data from server")?;
+        .context("Failed to send data to or receive data from server")?;
     if let Response::ShuttingDown(stats) = response {
         Ok(*stats)
     } else {
@@ -352,7 +368,7 @@ where
     //TODO: better error mapping?
     let response = conn
         .request(req)
-        .chain_err(|| "Failed to send data to or receive data from server")?;
+        .context("Failed to send data to or receive data from server")?;
     if let Response::Compile(response) = response {
         Ok(response)
     } else {
@@ -425,10 +441,10 @@ fn handle_compile_finished(
         trace!("compiler exited with status {}", ret);
         Ok(ret)
     } else if let Some(signal) = response.signal {
-        println!("Compiler killed by signal {}", signal);
+        println!("sccache: Compiler killed by signal {}", signal);
         Ok(-2)
     } else {
-        println!("Missing compiler exit status!");
+        println!("sccache: Missing compiler exit status!");
         Ok(-3)
     }
 }
@@ -464,17 +480,19 @@ where
                     return handle_compile_finished(result, stdout, stderr)
                 }
                 Ok(_) => bail!("unexpected response from server"),
-                Err(Error(ErrorKind::Io(ref e), _)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    eprintln!(
-                        "warning: sccache server looks like it shut down \
-                         unexpectedly, compiling locally instead"
-                    );
-                }
                 Err(e) => {
-                    return Err(e).chain_err(|| {
-                        //TODO: something better here?
-                        "error reading compile response from server"
-                    });
+                    match e.downcast_ref::<io::Error>() {
+                        Some(io_e) if io_e.kind() == io::ErrorKind::UnexpectedEof => {
+                            eprintln!(
+                                "sccache: warning: The server looks like it shut down \
+                                 unexpectedly, compiling locally instead"
+                            );
+                        }
+                        _ => {
+                            //TODO: something better here?
+                            return Err(e).context("error reading compile response from server");
+                        }
+                    }
                 }
             }
         }
@@ -494,12 +512,12 @@ where
     }
     let status = runtime.block_on(
         cmd.spawn()
-            .and_then(|c| c.wait().chain_err(|| "failed to wait for child")),
+            .and_then(|c| c.wait().fcontext("failed to wait for child")),
     )?;
 
     Ok(status.code().unwrap_or_else(|| {
         if let Some(sig) = status_signal(status) {
-            println!("Compile terminated by signal {}", sig);
+            println!("sccache: Compile terminated by signal {}", sig);
         }
         // Arbitrary.
         2
@@ -545,7 +563,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::ShowStats(fmt) => {
             trace!("Command::ShowStats({:?})", fmt);
             let srv = connect_or_start_server(get_port())?;
-            let stats = request_stats(srv).chain_err(|| "failed to get stats from server")?;
+            let stats = request_stats(srv).context("failed to get stats from server")?;
             match fmt {
                 StatsFormat::text => stats.print(),
                 StatsFormat::json => serde_json::to_writer(&mut io::stdout(), &stats)?,
@@ -560,12 +578,12 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         Command::StartServer => {
             trace!("Command::StartServer");
-            println!("Starting sccache server...");
-            let startup = run_server_process().chain_err(|| "failed to start server process")?;
+            println!("sccache: Starting the server...");
+            let startup = run_server_process().context("failed to start server process")?;
             match startup {
                 ServerStartup::Ok { port } => {
                     if port != DEFAULT_PORT {
-                        println!("Listening on port {}", port);
+                        println!("sccache: Listening on port {}", port);
                     }
                 }
                 ServerStartup::TimedOut => bail!("Timed out waiting for server startup"),
@@ -575,15 +593,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::StopServer => {
             trace!("Command::StopServer");
             println!("Stopping sccache server...");
-            let server =
-                connect_to_server(get_port()).chain_err(|| "couldn't connect to server")?;
+            let server = connect_to_server(get_port()).context("couldn't connect to server")?;
             let stats = request_shutdown(server)?;
             stats.print();
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
             let conn = connect_or_start_server(get_port())?;
-            let stats = request_zero_stats(conn).chain_err(|| "couldn't zero stats on server")?;
+            let stats = request_zero_stats(conn).context("couldn't zero stats on server")?;
             stats.print();
         }
         #[cfg(feature = "dist-client")]
@@ -604,7 +621,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     let cached_config = config::CachedConfig::load()?;
 
                     let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| format!("Failed to parse URL {}", auth_url))?;
+                        .map_err(|_| anyhow!("Failed to parse URL {}", auth_url))?;
                     let token = dist::client_auth::get_token_oauth2_code_grant_pkce(
                         client_id,
                         parsed_auth_url,
@@ -615,7 +632,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                         .with_mut(|c| {
                             c.dist.auth_tokens.insert(auth_url.to_owned(), token);
                         })
-                        .chain_err(|| "Unable to save auth token")?;
+                        .context("Unable to save auth token")?;
                     println!("Saved token")
                 }
                 config::DistAuth::Oauth2Implicit {
@@ -625,7 +642,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     let cached_config = config::CachedConfig::load()?;
 
                     let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| format!("Failed to parse URL {}", auth_url))?;
+                        .map_err(|_| anyhow!("Failed to parse URL {}", auth_url))?;
                     let token =
                         dist::client_auth::get_token_oauth2_implicit(client_id, parsed_auth_url)?;
 
@@ -633,7 +650,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                         .with_mut(|c| {
                             c.dist.auth_tokens.insert(auth_url.to_owned(), token);
                         })
-                        .chain_err(|| "Unable to save auth token")?;
+                        .context("Unable to save auth token")?;
                     println!("Saved token")
                 }
             };
@@ -646,24 +663,25 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             trace!("Command::DistStatus");
             let srv = connect_or_start_server(get_port())?;
             let status =
-                request_dist_status(srv).chain_err(|| "failed to get dist-status from server")?;
+                request_dist_status(srv).context("failed to get dist-status from server")?;
             serde_json::to_writer(&mut io::stdout(), &status)?;
         }
         #[cfg(feature = "dist-client")]
         Command::PackageToolchain(executable, out) => {
             use crate::compiler;
-            use futures_cpupool::CpuPool;
+            use futures_03::executor::ThreadPool;
 
             trace!("Command::PackageToolchain({})", executable.display());
             let mut runtime = Runtime::new()?;
             let jobserver = unsafe { Client::new() };
             let creator = ProcessCommandCreator::new(&jobserver);
             let env: Vec<_> = env::vars_os().collect();
-            let pool = CpuPool::new(1);
+            let pool = ThreadPool::builder().pool_size(1).create()?;
             let out_file = File::create(out)?;
             let cwd = env::current_dir().expect("A current working dir should exist");
 
-            let compiler = compiler::get_compiler_info(creator, &executable, &cwd, &env, &pool, None);
+            let compiler =
+                compiler::get_compiler_info(creator, &executable, &cwd, &env, &pool, None);
             let packager = compiler.map(|c| c.0.get_toolchain_packager());
             let res = packager.and_then(|p| p.write_pkg(out_file));
             runtime.block_on(res)?
@@ -694,7 +712,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 &mut io::stdout(),
                 &mut io::stderr(),
             );
-            return res.chain_err(|| "failed to execute compile");
+            return res.context("failed to execute compile");
         }
     }
 

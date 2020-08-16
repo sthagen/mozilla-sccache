@@ -3,22 +3,20 @@
 sccache - Shared Compilation Cache
 ==================================
 
-Sccache is a [ccache](https://ccache.dev/)-like tool. It is used as a compiler wrapper and avoids compilation when possible, storing a cache in a remote storage using the Amazon Simple Cloud Storage Service (S3) API, the Google Cloud Storage (GCS) API, or Redis.
+sccache is a [ccache](https://ccache.dev/)-like compiler caching tool. It is used as a compiler wrapper and avoids compilation when possible, storing cached results either on [local disk](#local) or in one of [several cloud storage backends](#storage-options).
 
-Sccache now includes [experimental Rust support](docs/Rust.md).
+sccache includes support for caching the compilation of C/C++ code, [Rust](docs/Rust.md), as well as NVIDIA's CUDA using [nvcc](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html).
 
-It works as a client-server. The client spawns a server if one is not running already, and sends the wrapped command line as a request to the server, which then does the work and returns stdout/stderr for the job.  The client-server model allows the server to be more efficient in its handling of the remote storage.
-
-Sccache can also be used with local storage instead of remote.
+sccache also provides [icecream](https://github.com/icecc/icecream)-style distributed compilation (automatic packaging of local toolchains) for all supported compilers (including Rust). The distributed compilation system includes several security features that icecream lacks such as authentication, transport layer encryption, and sandboxed compiler execution on build servers. See [the distributed quickstart](docs/DistributedQuickstart.md) guide for more information.
 
 ---
 
 Table of Contents (ToC)
 ======================
 
+* [Installation](#installation)
 * [Build Requirements](#build-requirements)
 * [Build](#build)
-* [Installation](#installation)
 * [Usage](#usage)
 * [Storage Options](#storage-options)
   * [Local](#local)
@@ -33,19 +31,99 @@ Table of Contents (ToC)
 
 ---
 
+## Installation
+
+There are prebuilt x86-64 binaries available for Windows, Linux (a portable binary compiled against musl), and macOS [on the releases page](https://github.com/mozilla/sccache/releases/latest). Several package managers also include sccache packages, you can install the latest release from source using cargo, or build directly from a source checkout.
+
+### macOS
+
+On macOS sccache can be installed via [Homebrew](https://brew.sh/):
+
+```bash
+brew install sccache
+```
+
+### Windows
+
+On Windows, sccache can be installed via [scoop](https://scoop.sh/):
+
+```
+scoop install sccache
+```
+
+### Via cargo
+
+If you have a Rust toolchain installed you can install sccache using cargo. **Note that this will compile sccache from source which is fairly resource-intensive. For CI purposes you should use prebuilt binary packages.**
+
+
+```bash
+cargo install sccache
+```
+
+---
+
+Usage
+-----
+
+Running sccache is like running ccache: prefix your compilation commands with it, like so:
+
+```bash
+sccache gcc -o foo.o -c foo.c
+```
+
+If you want to use sccache for caching Rust builds you can define `build.rustc-wrapper` in the
+[cargo configuration file](https://doc.rust-lang.org/cargo/reference/config.html).  For example, you can set it globally
+in `$HOME/.cargo/config` by adding:
+
+```toml
+[build]
+rustc-wrapper = "/path/to/sccache"
+```
+
+Note that you need to use cargo 1.40 or newer for this to work.
+
+Alternatively you can use the environment variable `RUSTC_WRAPPER`:
+
+```bash
+RUSTC_WRAPPER=/path/to/sccache cargo build
+```
+
+sccache supports gcc, clang, MSVC, rustc, NVCC, and [Wind River's diab compiler](https://www.windriver.com/products/development-tools/#diab_compiler).
+
+If you don't [specify otherwise](#storage-options), sccache will use a local disk cache.
+
+sccache works using a client-server model, where the server runs locally on the same machine as the client. The client-server model allows the server to be more efficient by keeping some state in memory. The sccache command will spawn a server process if one is not already running, or you can run `sccache --start-server` to start the background server process without performing any compilation.
+
+You can run `sccache --stop-server` to terminate the server. It will also terminate after (by default) 10 minutes of inactivity.
+
+Running `sccache --show-stats` will print a summary of cache statistics.
+
+Some notes about using `sccache` with [Jenkins](https://jenkins.io) are [here](docs/Jenkins.md).
+
+To use sccache with cmake, provide the following command line arguments to cmake 3.4 or newer:
+
+```
+-DCMAKE_C_COMPILER_LAUNCHER=sccache
+-DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+```
+
+---
+
 Build Requirements
 ------------------
 
-Sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus `rustc`). sccache currently requires **Rust 1.41.1**.
-
-We recommend you install Rust via [Rustup](https://rustup.rs/). The generated binaries can be built so that they are very [portable](#building-portable-binaries). By default `sccache` supports a local disk cache. To build `sccache` with support for `S3` and/or `Redis` cache backends, add `--features=all` or select a specific feature by passing `s3`, `gcs`, and/or `redis`. Refer the [Cargo Documentation](http://doc.crates.io/manifest.html#the-features-section) for details.
+sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus `rustc`). sccache currently requires **Rust 1.41.1**. We recommend you install Rust via [Rustup](https://rustup.rs/).
 
 Build
 -----
 
+If you are building sccache for non-development purposes make sure you use `cargo build --release` to get optimized binaries:
+
 ```bash
-cargo build [--features=all|redis|s3|gcs] [--release]
+cargo build --release [--features=all|s3|redis|gcs|memcached|azure]
 ```
+
+By default, `sccache` supports a local disk cache and S3. Use the `--features` flag to build `sccache` with support for other storage options. Refer the [Cargo Documentation](http://doc.crates.io/manifest.html#the-features-section) for details on how to select features with Cargo.
 
 ### Building portable binaries
 
@@ -78,7 +156,7 @@ Build with `cargo` and use `otool -L` to check that the resulting binary does no
 
 #### Windows
 
-On Windows it is fairly straight forward to just ship the required `libcrypto` and `libssl` DLLs with `sccache.exe`, but the binary might also depend on a few MSVC CRT DLLs that are not available on older Windows versions.
+On Windows it is fairly straightforward to just ship the required `libcrypto` and `libssl` DLLs with `sccache.exe`, but the binary might also depend on a few MSVC CRT DLLs that are not available on older Windows versions.
 
 It is possible to statically link against the CRT using a `.cargo/config` file with the following contents.
 
@@ -103,75 +181,13 @@ set OPENSSL_LIBS=libcrypto64MT:libssl64MT
 
 ---
 
-## Installation
-
-### With Rust
-
-```bash
-cargo install sccache
-```
-
-### macOS
-
-sccache can also be installed via [Homebrew](https://brew.sh/)
-
-```
-brew install sccache
-```
-
-### Windows
-
-sccache can also be installed via [scoop](https://scoop.sh/)
-
-```
-scoop install sccache
-```
-
----
-
-Usage
------
-
-Running sccache is like running ccache: wrap your compilation commands with it, like so:
-
-```bash
-sccache gcc -o foo.o -c foo.c
-```
-
-If you want to use sccache for your rust builds you can define `build.rustc-wrapper` in the
-[cargo configuration file](https://doc.rust-lang.org/cargo/reference/config.html).  For example, you can set it globally
-in `$HOME/.cargo/config` by adding:
-
-```toml
-[build]
-rustc-wrapper = "/path/to/sccache"
-```
-
-Note that you need to use cargo 1.40 or newer for this to work.
-
-Alternatively you can use the environment variable `RUSTC_WRAPPER`:
-
-```bash
-RUSTC_WRAPPER=/path/to/sccache cargo build
-```
-
-Sccache (tries to) support gcc, clang, [diab](https://www.windriver.com/products/development-tools/#diab_compiler) and MSVC. If you don't [specify otherwise](#storage-options), sccache will use a local disk cache.
-
-You can run `sccache --start-server` to start the background server process without performing any compilation.
-
-You can run `sccache --stop-server` to terminate the server. It will terminate after 10 minutes of inactivity.
-
-Running `sccache --show-stats` will print a summary of cache statistics.
-
-Some notes about using `sccache` with [Jenkins](https://jenkins.io) are [here](docs/Jenkins.md).
-
----
-
 Storage Options
 ---------------
 
 ### Local
-Sccache defaults to using local disk storage. You can set the `SCCACHE_DIR` environment variable to change the disk cache location. By default it will use a sensible location for the current platform: `~/.cache/sccache` on Linux, `%LOCALAPPDATA%\Mozilla\sccache` on Windows, and `~/Library/Caches/Mozilla.sccache` on MacOS. To limit the cache size set `SCCACHE_CACHE_SIZE`, for example `SCCACHE_CACHE_SIZE="1G"`. The default value is 10 Gigabytes.
+sccache defaults to using local disk storage. You can set the `SCCACHE_DIR` environment variable to change the disk cache location. By default it will use a sensible location for the current platform: `~/.cache/sccache` on Linux, `%LOCALAPPDATA%\Mozilla\sccache` on Windows, and `~/Library/Caches/Mozilla.sccache` on MacOS.
+
+The default cache size is 10 gigabytes. To change this, set `SCCACHE_CACHE_SIZE`, for example `SCCACHE_CACHE_SIZE="1G"`.
 
 ### S3
 If you want to use S3 storage for the sccache cache, you need to set the `SCCACHE_BUCKET` environment variable to the name of the S3 bucket to use.
@@ -179,6 +195,8 @@ If you want to use S3 storage for the sccache cache, you need to set the `SCCACH
 You can use `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to set the S3 credentials.  Alternately, you can set `AWS_IAM_CREDENTIALS_URL` to a URL that returns credentials in the format supported by the [EC2 metadata service](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#instance-metadata-security-credentials), and credentials will be fetched from that location as needed. In the absence of either of these options, credentials for the instance's IAM role will be fetched from the EC2 metadata service directly.
 
 If you need to override the default endpoint you can set `SCCACHE_ENDPOINT`. To connect to a minio storage for example you can set `SCCACHE_ENDPOINT=<ip>:<port>`. If your endpoint requires TLS, set `SCCACHE_S3_USE_SSL=true`.
+
+You can also define a prefix that will be prepended to the keys of all cache objects created and read within the S3 bucket, effectively creating a scope. To do that use the `SCCACHE_S3_KEY_PREFIX` environment variable. This can be useful when sharing a bucket with another application.
 
 
 ### Redis
@@ -198,34 +216,42 @@ To use Azure Blob Storage, you'll need your Azure connection string and an _exis
 environment variable to your connection string, and `SCCACHE_AZURE_BLOB_CONTAINER` to the name of the container to use.  Note that sccache will not create
 the container for you - you'll need to do that yourself.
 
-**Important:** The environment variables are only taken into account when the server starts, so only on the first run.
+**Important:** The environment variables are only taken into account when the server starts, i.e. only on the first run.
 
 ---
 
 Debugging
 ---------
 
-You can run the server manually in foreground mode by running `SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 sccache`, and send logging to stderr by setting the `RUST_LOG` environment variable, the format of which is described in more detail in the [env_logger](https://docs.rs/env_logger/0.5.3/env_logger/#enabling-logging) documentation.
+You can run the server manually in foreground mode by running `SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 sccache`, and send logging to stderr by setting the [`SCCACHE_LOG` environment variable](https://docs.rs/env_logger/0.7.1/env_logger/#enabling-logging) for example
 
-Alternately, you can set the `SCCACHE_ERROR_LOG` environment variable to a path and set `RUST_LOG` to get the server process to redirect its logging there (including the output of unhandled panics, since the server sets `RUST_BACKTRACE=1` internally).
+    SCCACHE_LOG=debug SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 sccache
+
+Alternately, you can set the `SCCACHE_ERROR_LOG` environment variable to a path and set `SCCACHE_LOG` to get the server process to redirect its logging there (including the output of unhandled panics, since the server sets `RUST_BACKTRACE=1` internally).
+
+    SCCACHE_ERROR_LOG=/tmp/sccache_log.txt SCCACHE_LOG=debug sccache
 
 ---
 
 Interaction with GNU `make` jobserver
 -------------------------------------
 
-Sccache provides support for a [GNU make jobserver](https://www.gnu.org/software/make/manual/html_node/Job-Slots.html). When the server is started from a process that provides a jobserver, sccache will use that jobserver and provide it to any processes it spawns. (If you are running sccache from a GNU make recipe, you will need to prefix the command with `+` to get this behavior.) If the sccache server is started without a jobserver present it will create its own with the number of slots equal to the number of available CPU cores.
+sccache provides support for a [GNU make jobserver](https://www.gnu.org/software/make/manual/html_node/Job-Slots.html). When the server is started from a process that provides a jobserver, sccache will use that jobserver and provide it to any processes it spawns. (If you are running sccache from a GNU make recipe, you will need to prefix the command with `+` to get this behavior.) If the sccache server is started without a jobserver present it will create its own with the number of slots equal to the number of available CPU cores.
 
 This is most useful when using sccache for Rust compilation, as rustc supports using a jobserver for parallel codegen, so this ensures that rustc will not overwhelm the system with codegen tasks. Cargo implements its own jobserver ([see the information on `NUM_JOBS` in the cargo documentation](https://doc.rust-lang.org/stable/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts)) for rustc to use, so using sccache for Rust compilation in cargo via `RUSTC_WRAPPER` should do the right thing automatically.
 
 ---
 
-Known caveats
+Known Caveats
 -------------
 
-(and possible future improvements)
+### General
 
-* Sccache doesn't try to be smart about the command line arguments it uses when computing a key for a given compilation result (like skipping preprocessor-specific arguments)
-* It doesn't support all kinds of compiler flags, and is certainly broken with a few of them. Really only the flags used during Firefox builds have been tested.
-* It doesn't support ccache's direct mode.
-* [It doesn't support an option like `CCACHE_BASEDIR`](https://github.com/mozilla/sccache/issues/35).
+* Absolute paths to files must match to get a cache hit. This means that even if you are using a shared cache, everyone will have to build at the same absolute path (i.e. not in $HOME) in order to benefit each other. In Rust this includes the source for third party crates which are stored in `$HOME/.cargo/registry/cache` by default.
+
+### Rust
+
+* Crates that invoke the system linker cannot be cached. This includes `bin`, `dylib`, `cdylib`, and `proc-macro` crates. You may be able to improve compilation time of large `bin` crates by converting them to a `lib` crate with a thin `bin` wrapper.
+* Incrementally compiled crates cannot be cached. By default, in the debug profile Cargo will use incremental compilation for workspace members and path dependencies. [You can disable incremental compilation.](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental)
+
+[More details on Rust caveats](/docs/Rust.md)

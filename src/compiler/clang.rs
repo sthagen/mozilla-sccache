@@ -22,7 +22,6 @@ use crate::dist;
 use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
 use futures::future::{self, Future};
-use futures_cpupool::CpuPool;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
@@ -31,20 +30,31 @@ use std::process;
 
 use crate::errors::*;
 
-/// A unit struct on which to implement `CCompilerImpl`.
+/// A struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
-pub struct Clang;
+pub struct Clang {
+    /// true iff this is clang++.
+    pub clangplusplus: bool,
+}
 
 impl CCompilerImpl for Clang {
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Clang
+    }
+    fn plusplus(&self) -> bool {
+        self.clangplusplus
     }
     fn parse_arguments(
         &self,
         arguments: &[OsString],
         cwd: &Path,
     ) -> CompilerArguments<ParsedArguments> {
-        gcc::parse_arguments(arguments, cwd, (&gcc::ARGS[..], &ARGS[..]))
+        gcc::parse_arguments(
+            arguments,
+            cwd,
+            (&gcc::ARGS[..], &ARGS[..]),
+            self.clangplusplus,
+        )
     }
 
     fn preprocess<T>(
@@ -99,6 +109,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-Xclang", OsString, Separated, XClang),
     take_arg!("-add-plugin", OsString, Separated, PassThrough),
     take_arg!("-debug-info-kind", OsString, Concatenated('='), PassThrough),
+    take_arg!("-dependency-file", PathBuf, Separated, DepArgumentPath),
     flag!("-fcolor-diagnostics", DiagnosticsColorFlag),
     flag!("-fcxx-modules", TooHardFlag),
     take_arg!("-fdebug-compilation-dir", OsString, Separated, PassThrough),
@@ -113,6 +124,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-include-pch", PathBuf, CanBeSeparated, PreprocessorArgumentPath),
     take_arg!("-load", PathBuf, Separated, ExtraHashFile),
     take_arg!("-mllvm", OsString, Separated, PassThrough),
+    take_arg!("-plugin-arg", OsString, Concatenated('-'), PassThrough),
     take_arg!("-target", OsString, Separated, PassThrough),
     flag!("-verify", PreprocessorArgumentFlag),
 ]);
@@ -125,13 +137,15 @@ mod test {
     use crate::mock_command::*;
     use crate::test::utils::*;
     use futures::Future;
-    use futures_cpupool::CpuPool;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        Clang.parse_arguments(&arguments, ".".as_ref())
+        Clang {
+            clangplusplus: false,
+        }
+        .parse_arguments(&arguments, ".".as_ref())
     }
 
     macro_rules! parses {
@@ -149,8 +163,6 @@ mod test {
         assert_eq!(Some("foo.c"), a.input.to_str());
         assert_eq!(Language::C, a.language);
         assert_map_contains!(a.outputs, ("obj", PathBuf::from("foo.o")));
-        //TODO: fix assert_map_contains to assert no extra keys!
-        assert_eq!(1, a.outputs.len());
         assert!(a.preprocessor_args.is_empty());
         assert!(a.common_args.is_empty());
     }
@@ -164,8 +176,6 @@ mod test {
         assert_eq!(Some("foo.cxx"), a.input.to_str());
         assert_eq!(Language::Cxx, a.language);
         assert_map_contains!(a.outputs, ("obj", PathBuf::from("foo.o")));
-        //TODO: fix assert_map_contains to assert no extra keys!
-        assert_eq!(1, a.outputs.len());
         assert_eq!(ovec!["-Iinclude", "-include", "file"], a.preprocessor_args);
         assert_eq!(ovec!["-arch", "xyz", "-fabc"], a.common_args);
     }
@@ -272,7 +282,76 @@ mod test {
             "-debug-info-kind=constructor"
         );
         assert_eq!(
-            ovec!["-Xclang", "-mllvm", "-Xclang", "-instcombine-lower-dbg-declare=0", "-Xclang", "-debug-info-kind=constructor"],
+            ovec![
+                "-Xclang",
+                "-mllvm",
+                "-Xclang",
+                "-instcombine-lower-dbg-declare=0",
+                "-Xclang",
+                "-debug-info-kind=constructor"
+            ],
+            a.common_args
+        );
+    }
+
+    #[test]
+    fn test_parse_xclang_plugin_arg_blink_gc_plugin() {
+        let a = parses!(
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-Xclang",
+            "-add-plugin",
+            "-Xclang",
+            "blink-gc-plugin",
+            "-Xclang",
+            "-plugin-arg-blink-gc-plugin",
+            "-Xclang",
+            "no-members-in-stack-allocated"
+        );
+        assert_eq!(
+            ovec![
+                "-Xclang",
+                "-add-plugin",
+                "-Xclang",
+                "blink-gc-plugin",
+                "-Xclang",
+                "-plugin-arg-blink-gc-plugin",
+                "-Xclang",
+                "no-members-in-stack-allocated"
+            ],
+            a.common_args
+        );
+    }
+
+    #[test]
+    fn test_parse_xclang_plugin_arg_find_bad_constructs() {
+        let a = parses!(
+            "-c",
+            "foo.c",
+            "-o",
+            "foo.o",
+            "-Xclang",
+            "-add-plugin",
+            "-Xclang",
+            "find-bad-constructs",
+            "-Xclang",
+            "-plugin-arg-find-bad-constructs",
+            "-Xclang",
+            "check-ipc"
+        );
+        assert_eq!(
+            ovec![
+                "-Xclang",
+                "-add-plugin",
+                "-Xclang",
+                "find-bad-constructs",
+                "-Xclang",
+                "-plugin-arg-find-bad-constructs",
+                "-Xclang",
+                "check-ipc"
+            ],
             a.common_args
         );
     }
