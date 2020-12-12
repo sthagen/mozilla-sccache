@@ -66,7 +66,7 @@ impl CCompilerImpl for MSVC {
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
-        _rewrite_includes_only: bool,
+        rewrite_includes_only: bool,
     ) -> SFuture<process::Output>
     where
         T: CommandCreatorSync,
@@ -79,6 +79,8 @@ impl CCompilerImpl for MSVC {
             env_vars,
             may_dist,
             &self.includes_prefix,
+            rewrite_includes_only,
+            self.is_clang,
         )
     }
 
@@ -254,7 +256,7 @@ macro_rules! msvc_args {
 msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("?", SuppressCompilation),
     msvc_flag!("C", PassThrough), // Ignored unless a preprocess-only flag is specified.
-    msvc_take_arg!("D", OsString, Concatenated, PreprocessorArgument),
+    msvc_take_arg!("D", OsString, CanBeSeparated, PreprocessorArgument),
     msvc_flag!("E", SuppressCompilation),
     msvc_take_arg!("EH", OsString, Concatenated, PassThroughWithSuffix), // /EH[acsr\-]+ - TODO: use a regex?
     msvc_flag!("EP", SuppressCompilation),
@@ -308,7 +310,9 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("LDd", PassThrough),
     msvc_flag!("MD", PassThrough),
     msvc_flag!("MDd", PassThrough),
-    msvc_flag!("MP", TooHardFlag), // Multiple source files.
+    // MP would normally be TooHardFlag but multiple inputs are not supported.
+    // With a single input, it's fine to passthrough.
+    msvc_take_arg!("MP", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("MT", PassThrough),
     msvc_flag!("MTd", PassThrough),
     msvc_flag!("O1", PassThrough),
@@ -561,6 +565,7 @@ pub fn parse_arguments(
                 Some(DiagnosticsColor(_))
                 | Some(DiagnosticsColorFlag)
                 | Some(NoDiagnosticsColorFlag)
+                | Some(Arch(_))
                 | Some(PassThrough(_))
                 | Some(PassThroughPath(_)) => &mut common_args,
 
@@ -690,15 +695,29 @@ pub fn preprocess<T>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
-    _may_dist: bool,
+    may_dist: bool,
     includes_prefix: &str,
+    rewrite_includes_only: bool,
+    is_clang: bool,
 ) -> SFuture<process::Output>
 where
     T: CommandCreatorSync,
 {
     let mut cmd = creator.clone().new_command_sync(executable);
-    cmd.arg("-EP")
-        .arg(&parsed_args.input)
+
+    // When performing distributed compilation, line number info is important for error
+    // reporting and to not cause spurious compilation failure (e.g. no exceptions build
+    // fails due to exceptions transitively included in the stdlib).
+    // With -fprofile-generate line number information is important, so use -E.
+    // Otherwise, use -EP to maximize cache hits (because no absolute file paths are
+    // emitted) and improve performance.
+    if may_dist || parsed_args.profile_generate {
+        cmd.arg("-E");
+    } else {
+        cmd.arg("-EP");
+    }
+
+    cmd.arg(&parsed_args.input)
         .arg("-nologo")
         .args(&parsed_args.preprocessor_args)
         .args(&parsed_args.dependency_args)
@@ -708,6 +727,9 @@ where
         .current_dir(&cwd);
     if parsed_args.depfile.is_some() || parsed_args.msvc_show_includes {
         cmd.arg("-showIncludes");
+    }
+    if rewrite_includes_only && is_clang {
+        cmd.arg("-clang:-frewrite-includes");
     }
 
     if log_enabled!(Debug) {

@@ -276,7 +276,7 @@ mod server {
     use crate::jwt;
     use byteorder::{BigEndian, ReadBytesExt};
     use flate2::read::ZlibDecoder as ZlibReadDecoder;
-    use rand::RngCore;
+    use rand::{rngs::OsRng, RngCore};
     use rouille::accept;
     use std::collections::HashMap;
     use std::io::Read;
@@ -609,12 +609,14 @@ mod server {
     impl dist::JobAuthorizer for JWTJobAuthorizer {
         fn generate_token(&self, job_id: JobId) -> Result<String> {
             let claims = JobJwt { job_id };
-            jwt::encode(&JWT_HEADER, &claims, &self.server_key)
+            let key = jwt::EncodingKey::from_secret(&self.server_key);
+            jwt::encode(&JWT_HEADER, &claims, &key)
                 .map_err(|e| anyhow!("Failed to create JWT for job: {}", e))
         }
         fn verify_token(&self, job_id: JobId, token: &str) -> Result<()> {
             let valid_claims = JobJwt { job_id };
-            jwt::decode(&token, &self.server_key, &JWT_VALIDATION)
+            let key = jwt::DecodingKey::from_secret(&self.server_key);
+            jwt::decode(&token, &key, &JWT_VALIDATION)
                 .map_err(|e| anyhow!("JWT decode failed: {}", e))
                 .and_then(|res| {
                     fn identical_t<T>(_: &T, _: &T) {}
@@ -893,10 +895,8 @@ mod server {
                 create_https_cert_and_privkey(public_addr)
                     .context("failed to create HTTPS certificate for server")?;
             let mut jwt_key = vec![0; JWT_KEY_LENGTH];
-            let mut rng =
-                rand::OsRng::new().context("Failed to initialise a random number generator")?;
-            rng.fill_bytes(&mut jwt_key);
-            let server_nonce = ServerNonce::from_rng(&mut rng);
+            OsRng.fill_bytes(&mut jwt_key);
+            let server_nonce = ServerNonce::new();
 
             Ok(Self {
                 public_addr,

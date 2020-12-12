@@ -4,25 +4,46 @@ matrix:
   include:
     # OS compat
     - os: linux
-    # As of this writing, stable Rust (1.44.0) and the OS X version on TravisCI
-    # do not work well together.
+    - os: linux
+      arch: arm64
     - os: osx
-      rust: 1.43.1
 
     # rustc version compat
-    - rust: 1.41.1 # oldest supported version, keep in sync with README.md
-    - rust: 1.41.1
-      env: DIST_SCCACHE=1
+    - rust: 1.43.0 # oldest supported version, keep in sync with README.md
+    - rust: 1.43.0
+      env: EXTRA_FEATURES="dist-server openssl/vendored"
     - rust: beta
     - rust: nightly
+      env: EXTRA_FEATURES="unstable"
 
     # deployments
-    - env: DEPLOY=1 TARGET=x86_64-apple-darwin OPENSSL_STATIC=yes
-      script: cargo build --release --target $TARGET --features=all
+    - env: DEPLOY=1 TARGET=x86_64-apple-darwin
+      script: cargo build --release --target $TARGET --features=openssl/vendored
       os: osx
-    - env: DEPLOY=1 TARGET=x86_64-unknown-linux-musl OPENSSL_DIR=$HOME/openssl-musl
-      before_script: ./scripts/travis-musl-openssl.sh
-      script: cargo build --release --target $TARGET --features=all
+    - env: DEPLOY=1 TARGET=aarch64-apple-darwin SDKROOT=/Applications/Xcode-12.2.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX11.0.sdk
+      before_script: rustup target add aarch64-apple-darwin
+      script: cargo build --release --target $TARGET --features=openssl/vendored
+      os: osx
+      osx_image: xcode12.2
+      rust: beta
+    - env: DEPLOY=1 TARGET=x86_64-unknown-linux-musl
+      before_script: rustup target add x86_64-unknown-linux-musl
+      script: cargo build --release --target $TARGET --features=openssl/vendored
+      addons:
+        apt:
+          packages:
+          - musl-tools
+    - env: DEPLOY=1 TARGET=x86_64-unknown-linux-musl SUFFIX=-dist
+      before_script: rustup target add x86_64-unknown-linux-musl
+      script: cargo build --release --target $TARGET --no-default-features --features="openssl/vendored dist-server"
+      addons:
+        apt:
+          packages:
+          - musl-tools
+    - env: DEPLOY=1 TARGET=aarch64-unknown-linux-musl CC_aarch64_unknown_linux_musl=musl-gcc
+      before_script: rustup target add aarch64-unknown-linux-musl
+      script: cargo build --release --target $TARGET --features=openssl/vendored
+      arch: arm64
       addons:
         apt:
           packages:
@@ -31,17 +52,13 @@ matrix:
     - rust: nightly
 
 before_script:
-  - export EXTRA_FEATURES=
   - if [[ "${TRAVIS_RUST_VERSION}" = "stable" ]]; then rustup component add rustfmt && cargo fmt -- --check; fi
-  - if [[ "${TRAVIS_RUST_VERSION}" = "nightly" ]]; then export EXTRA_FEATURES="$EXTRA_FEATURES unstable"; fi
-  - if [[ "${DIST_SCCACHE}" = "1" ]]; then export EXTRA_FEATURES="$EXTRA_FEATURES dist-client dist-server"; fi
 
 script:
-  - cargo build --verbose --features="all ${EXTRA_FEATURES}" || exit 1
+  - cargo build --verbose --features="${EXTRA_FEATURES}" || exit 1
   - RUST_BACKTRACE=1 cargo test --all --verbose --no-default-features --features="${EXTRA_FEATURES}" 
-  - RUST_BACKTRACE=1 cargo test --all --verbose --features="all ${EXTRA_FEATURES}"
-  # Requires PR #321
-  #- if [[ "${DIST_SCCACHE}" = "1" ]]; then RUST_BACKTRACE=1 cargo test --all --verbose --features="all dist-tests ${EXTRA_FEATURES}" test_dist_ -- --test-threads 1; fi
+  - RUST_BACKTRACE=1 cargo test --all --verbose --features="${EXTRA_FEATURES}"
+  - case "${EXTRA_FEATURES}" in *dist-server*) RUST_BACKTRACE=1 cargo test --all --verbose --features="dist-tests ${EXTRA_FEATURES}" test_dist_ -- --test-threads 1 ;; esac
 
 before_deploy:
   - "./scripts/prep_deploy.sh"
