@@ -695,8 +695,7 @@ fn normpath(path: &str) -> String {
             if size == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let mut wchars = Vec::with_capacity(size as usize);
-            wchars.resize(size as usize, 0);
+            let mut wchars = vec![0; size as usize];
             if unsafe {
                 GetFinalPathNameByHandleW(handle, wchars.as_mut_ptr(), wchars.len() as u32, 0)
             } == 0
@@ -708,12 +707,9 @@ fn normpath(path: &str) -> String {
             let o = OsString::from_wide(&wchars[4..wchars.len() - 1]);
             o.into_string()
                 .map(|s| s.replace('\\', "/"))
-                .or(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Error converting string",
-                )))
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "Error converting string"))
         })
-        .unwrap_or(path.replace('\\', "/"))
+        .unwrap_or_else(|_| path.replace('\\', "/"))
 }
 
 #[cfg(not(windows))]
@@ -721,6 +717,7 @@ fn normpath(path: &str) -> String {
     path.to_owned()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn preprocess<T>(
     creator: &T,
     executable: &Path,
@@ -1075,7 +1072,7 @@ mod test {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
-        assert_eq!(profile_generate, true);
+        assert!(profile_generate);
         assert!(preprocessor_args.is_empty());
         assert_eq!(
             dependency_args,

@@ -24,6 +24,7 @@ use crate::compiler::rust::{Rust, RustupProxy};
 use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
+use crate::lru_disk_cache;
 use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunCommand};
 use crate::util::{fmt_duration_as_secs, ref_env, run_input_output, SpawnExt};
 use filetime::FileTime;
@@ -1011,7 +1012,10 @@ g++
 gcc
 #elif defined(__DCC__)
 diab
+#else
+unknown
 #endif
+__VERSION__
 "
     .to_vec();
     let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
@@ -1040,17 +1044,30 @@ diab
             Ok(s) => s,
             Err(_) => return f_err(anyhow!("Failed to parse output")),
         };
-        for line in stdout.lines() {
-            //TODO: do something smarter here.
-            match line {
+        let mut lines = stdout.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                None
+            } else {
+                Some(line)
+            }
+        });
+        if let Some(kind) = lines.next() {
+            let version = lines
+                .next()
+                // In case the compiler didn't expand the macro.
+                .filter(|&line| line != "__VERSION__")
+                .map(str::to_owned);
+            match kind {
                 "clang" | "clang++" => {
-                    debug!("Found {}", line);
+                    debug!("Found {}", kind);
                     return Box::new(
                         CCompiler::new(
                             Clang {
-                                clangplusplus: line == "clang++",
+                                clangplusplus: kind == "clang++",
                             },
                             executable,
+                            version,
                             &pool,
                         )
                         .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
@@ -1059,25 +1076,26 @@ diab
                 "diab" => {
                     debug!("Found diab");
                     return Box::new(
-                        CCompiler::new(Diab, executable, &pool)
+                        CCompiler::new(Diab, executable, version, &pool)
                             .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
                     );
                 }
                 "gcc" | "g++" => {
-                    debug!("Found {}", line);
+                    debug!("Found {}", kind);
                     return Box::new(
                         CCompiler::new(
                             GCC {
-                                gplusplus: line == "g++",
+                                gplusplus: kind == "g++",
                             },
                             executable,
+                            version,
                             &pool,
                         )
                         .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
                     );
                 }
                 "msvc" | "msvc-clang" => {
-                    let is_clang = line == "msvc-clang";
+                    let is_clang = kind == "msvc-clang";
                     debug!("Found MSVC (is clang: {})", is_clang);
                     let prefix = msvc::detect_showincludes_prefix(
                         &creator,
@@ -1094,6 +1112,7 @@ diab
                                 is_clang,
                             },
                             executable,
+                            version,
                             &pool,
                         )
                         .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
@@ -1102,7 +1121,7 @@ diab
                 "nvcc" => {
                     debug!("Found NVCC");
                     return Box::new(
-                        CCompiler::new(NVCC, executable, &pool)
+                        CCompiler::new(NVCC, executable, version, &pool)
                             .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
                     );
                 }
@@ -1157,10 +1176,7 @@ mod test {
         let f = TestFixture::new();
         let creator = new_creator();
         let pool = ThreadPool::sized(1);
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "foo\nbar\ngcc", "")),
-        );
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "\n\ngcc", "")));
         let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
             .wait()
             .unwrap()
@@ -1173,10 +1189,7 @@ mod test {
         let f = TestFixture::new();
         let creator = new_creator();
         let pool = ThreadPool::sized(1);
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "clang\nfoo", "")),
-        );
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "clang\n", "")));
         let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
             .wait()
             .unwrap()
@@ -1198,10 +1211,7 @@ mod test {
         let prefix = String::from("blah: ");
         let stdout = format!("{}{}\r\n", prefix, s);
         // Compiler detection output
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "foo\nmsvc\nbar", "")),
-        );
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "\nmsvc\n", "")));
         // showincludes prefix detection output
         next_command(
             &creator,
@@ -1219,10 +1229,7 @@ mod test {
         let f = TestFixture::new();
         let creator = new_creator();
         let pool = ThreadPool::sized(1);
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "nvcc\nfoo", "")),
-        );
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "nvcc\n", "")));
         let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
             .wait()
             .unwrap()
@@ -1272,10 +1279,7 @@ LLVM version: 6.0",
         let f = TestFixture::new();
         let creator = new_creator();
         let pool = ThreadPool::sized(1);
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "foo\ndiab\nbar", "")),
-        );
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "\ndiab\n", "")));
         let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
             .wait()
             .unwrap()
@@ -1320,6 +1324,48 @@ LLVM version: 6.0",
         )
         .wait()
         .is_err());
+    }
+
+    #[test]
+    fn test_compiler_version_affects_hash() {
+        let f = TestFixture::new();
+        let creator = new_creator();
+        let pool = ThreadPool::sized(1);
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let cwd = f.tempdir.path();
+
+        let results: Vec<_> = [11, 12]
+            .iter()
+            .map(|version| {
+                let output = format!("clang\n\"{}.0.0\"", version);
+                next_command(&creator, Ok(MockChild::new(exit_status(0), &output, "")));
+                let c = detect_compiler(
+                    creator.clone(),
+                    &f.bins[0],
+                    f.tempdir.path(),
+                    &[],
+                    &pool,
+                    None,
+                )
+                .wait()
+                .unwrap()
+                .0;
+                next_command(
+                    &creator,
+                    Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+                );
+                let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
+                    CompilerArguments::Ok(h) => h,
+                    o => panic!("Bad result from parse_arguments: {:?}", o),
+                };
+                hasher
+                    .generate_hash_key(&creator, cwd.to_path_buf(), vec![], false, &pool, false)
+                    .wait()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert_ne!(results[0].key, results[1].key);
     }
 
     #[test]
@@ -1401,10 +1447,7 @@ LLVM version: 6.0",
             }))
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
             CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
@@ -1438,10 +1481,7 @@ LLVM version: 6.0",
             }))
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -1508,10 +1548,7 @@ LLVM version: 6.0",
             }))
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
             CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, f) => {
                 // wait on cache write future so we don't race with it!
@@ -1545,10 +1582,7 @@ LLVM version: 6.0",
             }))
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -1622,10 +1656,7 @@ LLVM version: 6.0",
             }))
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
             CompileResult::CacheMiss(MissType::CacheReadError, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
@@ -1707,10 +1738,7 @@ LLVM version: 6.0",
             }))
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
             CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
@@ -1737,10 +1765,7 @@ LLVM version: 6.0",
             .wait()
             .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(
-            true,
-            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-        );
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
             CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
@@ -1783,7 +1808,7 @@ LLVM version: 6.0",
         .unwrap()
         .0;
         // We should now have a fake object file.
-        assert_eq!(fs::metadata(&obj).is_ok(), true);
+        assert!(fs::metadata(&obj).is_ok());
         // The preprocessor invocation.
         const PREPROCESSOR_STDERR: &[u8] = b"something went wrong";
         next_command(
@@ -1901,10 +1926,7 @@ LLVM version: 6.0",
                 .wait()
                 .unwrap();
             // Ensure that the object file was created.
-            assert_eq!(
-                true,
-                fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
-            );
+            assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
             match cached {
                 CompileResult::CacheMiss(MissType::ForcedRecache, DistType::Error, _, f) => {
                     // wait on cache write future so we don't race with it!

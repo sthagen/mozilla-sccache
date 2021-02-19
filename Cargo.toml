@@ -1,6 +1,6 @@
 [package]
 name = "sccache"
-version = "0.2.15-alpha.0"
+version = "0.2.16-alpha.0"
 authors = ["Ted Mielczarek <ted@mielczarek.org>", "Alex Crichton <alex@alexcrichton.com>"]
 license = "Apache-2.0"
 description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible, storing a cache in a remote storage using the S3 API."
@@ -46,9 +46,9 @@ jobserver = "0.1"
 jsonwebtoken = { version = "7", optional = true }
 lazy_static = "1.0.0"
 libc = "0.2.10"
+linked-hash-map = "0.5"
 local-encoding = "0.2.0"
 log = "0.4"
-lru-disk-cache = { path = "lru-disk-cache", version = "0.4.0" }
 md-5 = { version = "0.9", optional = true }
 memcached-rs = { version = "0.4" , optional = true }
 num_cpus = "1.0"
@@ -56,7 +56,7 @@ number_prefix = "0.4"
 openssl = { version = "0.10", optional = true }
 percent-encoding = { version = "2", optional = true }
 rand = "0.7"
-redis = { version = "0.18", optional = true, features = ["aio", "tokio-comp"] }
+redis = { version = "0.17", optional = true }
 regex = "1"
 reqwest = { version = "0.9.11", optional = true }
 retry = "1"
@@ -95,15 +95,11 @@ syslog = { version = "5", optional = true }
 void = { version = "1", optional = true }
 version-compare = { version = "0.0.11", optional = true }
 
-[patch.crates-io]
-# Waiting for #151 to make it into a release
-tiny_http = { git = "https://github.com/tiny-http/tiny-http.git", rev = "619680de" }
-
 [dev-dependencies]
 assert_cmd = "1"
 cc = "1.0"
 chrono = "0.4"
-itertools = "0.9"
+itertools = "0.10"
 predicates = "1"
 selenium-rs = "0.1"
 
