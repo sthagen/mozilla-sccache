@@ -21,10 +21,10 @@ use crate::compiler::{gcc, write_temp_file, Cacheable, CompileCommand, CompilerA
 use crate::dist;
 use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
-use futures::future::{self, Future};
 use log::Level::Trace;
 use std::ffi::OsString;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -33,11 +33,12 @@ use crate::errors::*;
 
 /// A unit struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
-pub struct NVCC;
+pub struct Nvcc;
 
-impl CCompilerImpl for NVCC {
+#[async_trait]
+impl CCompilerImpl for Nvcc {
     fn kind(&self) -> CCompilerKind {
-        CCompilerKind::NVCC
+        CCompilerKind::Nvcc
     }
     fn plusplus(&self) -> bool {
         false
@@ -47,10 +48,17 @@ impl CCompilerImpl for NVCC {
         arguments: &[OsString],
         cwd: &Path,
     ) -> CompilerArguments<ParsedArguments> {
-        gcc::parse_arguments(arguments, cwd, (&gcc::ARGS[..], &ARGS[..]), false)
+        gcc::parse_arguments(
+            arguments,
+            cwd,
+            (&gcc::ARGS[..], &ARGS[..]),
+            false,
+            self.kind(),
+        )
     }
 
-    fn preprocess<T>(
+    #[allow(clippy::too_many_arguments)]
+    async fn preprocess<T>(
         &self,
         creator: &T,
         executable: &Path,
@@ -59,7 +67,7 @@ impl CCompilerImpl for NVCC {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
-    ) -> SFuture<process::Output>
+    ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
@@ -131,9 +139,13 @@ impl CCompilerImpl for NVCC {
         if !parsed_args.dependency_args.is_empty() {
             let first = run_input_output(dep_before_preprocessor(), None);
             let second = run_input_output(cmd, None);
-            Box::new(first.join(second).map(|(f, s)| s))
+            // TODO: If we need to chain these to emulate a frontend, shouldn't
+            // we explicitly wait on the first one before starting the second one?
+            // (rather than via which drives these concurrently)
+            let (_f, s) = futures::future::try_join(first, second).await?;
+            Ok(s)
         } else {
-            Box::new(run_input_output(cmd, None))
+            run_input_output(cmd, None).await
         }
     }
 
@@ -162,6 +174,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     //todo: refactor show_includes into dependency_args
 
     take_arg!("--archive-options options", OsString, CanBeSeparated('='), PassThrough),
+    take_arg!("--compiler-bindir", PathBuf, CanBeSeparated('='), ExtraHashFile),
     take_arg!("--compiler-options", OsString, CanBeSeparated('='), PreprocessorArgument),
     flag!("--expt-extended-lambda", PreprocessorArgumentFlag),
     flag!("--expt-relaxed-constexpr", PreprocessorArgumentFlag),
@@ -184,6 +197,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-Xnvlink", OsString, CanBeSeparated('='), PassThrough),
     take_arg!("-Xptxas", OsString, CanBeSeparated('='), PassThrough),
     take_arg!("-arch", OsString, CanBeSeparated('='), PassThrough),
+    take_arg!("-ccbin", PathBuf, CanBeSeparated('='), ExtraHashFile),
     take_arg!("-code", OsString, CanBeSeparated('='), PassThrough),
     flag!("-dc", DoCompilation),
     flag!("-expt-extended-lambda", PreprocessorArgumentFlag),
@@ -205,13 +219,12 @@ mod test {
     use crate::compiler::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
-    use futures::Future;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        NVCC.parse_arguments(&arguments, ".".as_ref())
+        Nvcc.parse_arguments(&arguments, ".".as_ref())
     }
 
     macro_rules! parses {

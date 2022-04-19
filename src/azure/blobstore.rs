@@ -14,14 +14,11 @@
 // limitations under the License.
 
 use crate::azure::credentials::*;
-use futures::{Future, Stream};
-use hmac::{Hmac, Mac, NewMac};
-use hyper::header::HeaderValue;
-use hyper::Method;
+use hmac::{Hmac, Mac};
 use hyperx::header;
 use md5::{Digest, Md5};
-use reqwest::r#async::{Client, Request};
 use reqwest::Url;
+use reqwest::{header::HeaderValue, Client, Method, Request};
 use sha2::Sha256;
 use std::fmt;
 use std::str::FromStr;
@@ -32,7 +29,7 @@ use crate::util::HeadersExt;
 const BLOB_API_VERSION: &str = "2017-04-17";
 
 fn hmac(data: &[u8], secret: &[u8]) -> Vec<u8> {
-    let mut hmac = Hmac::<Sha256>::new_varkey(secret).expect("HMAC can take key of any size");
+    let mut hmac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC can take key of any size");
     hmac.update(data);
     hmac.finalize().into_bytes().as_slice().to_vec()
 }
@@ -49,30 +46,39 @@ fn md5(data: &[u8]) -> String {
     base64::encode_config(&digest.finalize(), base64::STANDARD)
 }
 
-pub struct BlobContainer {
+#[async_trait]
+pub trait BlobContainer: fmt::Display + Send + Sync {
+    async fn get(&self, key: &str, creds: &AzureCredentials) -> Result<Vec<u8>>;
+    async fn put(&self, key: &str, content: Vec<u8>, creds: &AzureCredentials) -> Result<()>;
+}
+
+pub struct HttpBlobContainer {
     url: String,
     client: Client,
 }
 
-impl fmt::Display for BlobContainer {
+impl fmt::Display for HttpBlobContainer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "BlobContainer(url={})", self.url)
     }
 }
 
-impl BlobContainer {
-    pub fn new(base_url: &str, container_name: &str) -> Result<BlobContainer> {
+impl HttpBlobContainer {
+    pub fn new(base_url: &str, container_name: &str) -> Result<Self> {
         assert!(
             base_url.ends_with('/'),
             "base_url is assumed to end in a trailing slash"
         );
-        Ok(BlobContainer {
+        Ok(Self {
             url: format!("{}{}/", base_url, container_name),
             client: Client::new(),
         })
     }
+}
 
-    pub fn get(&self, key: &str, creds: &AzureCredentials) -> SFuture<Vec<u8>> {
+#[async_trait]
+impl BlobContainer for HttpBlobContainer {
+    async fn get(&self, key: &str, creds: &AzureCredentials) -> Result<Vec<u8>> {
         let url_string = format!("{}{}", self.url, key);
         let uri = Url::from_str(&url_string).unwrap();
         let dt = chrono::Utc::now();
@@ -90,10 +96,7 @@ impl BlobContainer {
             creds,
         );
 
-        let uri_copy = uri.clone();
-        let uri_second_copy = uri.clone();
-
-        let mut request = Request::new(Method::GET, uri);
+        let mut request = Request::new(Method::GET, uri.clone());
         request.headers_mut().insert(
             "x-ms-date",
             HeaderValue::from_str(&date).expect("Date is an invalid header value"),
@@ -108,46 +111,34 @@ impl BlobContainer {
             );
         }
 
-        Box::new(
-            self.client
-                .execute(request)
-                .fwith_context(move || format!("failed GET: {}", uri_copy))
-                .and_then(|res| {
-                    if res.status().is_success() {
-                        let content_length = res
-                            .headers()
-                            .get_hyperx::<header::ContentLength>()
-                            .map(|header::ContentLength(len)| len);
-                        Ok((res.into_body(), content_length))
-                    } else {
-                        Err(BadHttpStatusError(res.status()).into())
-                    }
-                })
-                .and_then(|(body, content_length)| {
-                    body.fold(Vec::new(), |mut body, chunk| {
-                        body.extend_from_slice(&chunk);
-                        Ok::<_, reqwest::Error>(body)
-                    })
-                    .fcontext("failed to read HTTP body")
-                    .and_then(move |bytes| {
-                        if let Some(len) = content_length {
-                            if len != bytes.len() as u64 {
-                                bail!(format!(
-                                    "Bad HTTP body size read: {}, expected {}",
-                                    bytes.len(),
-                                    len
-                                ));
-                            } else {
-                                info!("Read {} bytes from {}", bytes.len(), uri_second_copy);
-                            }
-                        }
-                        Ok(bytes)
-                    })
-                }),
-        )
+        let res = self
+            .client
+            .execute(request)
+            .await
+            .with_context(|| format!("failed GET: {}", &uri))?;
+
+        let (bytes, content_length) = if res.status().is_success() {
+            let content_length = res.content_length();
+            (res.bytes().await?, content_length)
+        } else {
+            return Err(BadHttpStatusError(res.status()).into());
+        };
+
+        if let Some(len) = content_length {
+            if len != bytes.len() as u64 {
+                bail!(format!(
+                    "Bad HTTP body size read: {}, expected {}",
+                    bytes.len(),
+                    len
+                ));
+            } else {
+                info!("Read {} bytes from {}", bytes.len(), &uri);
+            }
+        }
+        Ok(bytes.into_iter().collect())
     }
 
-    pub fn put(&self, key: &str, content: Vec<u8>, creds: &AzureCredentials) -> SFuture<()> {
+    async fn put(&self, key: &str, content: Vec<u8>, creds: &AzureCredentials) -> Result<()> {
         let url_string = format!("{}{}", self.url, key);
         let uri = Url::from_str(&url_string).unwrap();
         let dt = chrono::Utc::now();
@@ -206,7 +197,7 @@ impl BlobContainer {
 
         *request.body_mut() = Some(content.into());
 
-        Box::new(self.client.execute(request).then(|result| match result {
+        match self.client.execute(request).await {
             Ok(res) => {
                 if res.status().is_success() {
                     trace!("PUT succeeded");
@@ -220,7 +211,7 @@ impl BlobContainer {
                 trace!("PUT failed with error: {:?}", e);
                 Err(e.into())
             }
-        }))
+        }
     }
 }
 
@@ -266,7 +257,7 @@ fn compute_auth_header(
         format!(
             "SharedKey {}:{}",
             creds.azure_account_name(),
-            signature(&string_to_sign, &account_key)
+            signature(&string_to_sign, account_key)
         )
     })
 }
@@ -285,7 +276,9 @@ fn canonicalize_resource(uri: &Url, account_name: &str) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
-    use tokio_compat::runtime::current_thread::Runtime;
+    use tokio::runtime::Runtime;
+    use wiremock::matchers::{body_bytes, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_signing() {
@@ -332,15 +325,16 @@ mod test {
 
         let container_name = "sccache";
         let creds = AzureCredentials::new(
-            &blob_endpoint,
-            &client_name,
+            blob_endpoint,
+            client_name,
             client_key,
             container_name.to_string(),
         );
 
-        let mut runtime = Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
 
-        let container = BlobContainer::new(creds.azure_blob_endpoint(), container_name).unwrap();
+        let container =
+            HttpBlobContainer::new(creds.azure_blob_endpoint(), container_name).unwrap();
 
         let put_future = container.put("foo", b"barbell".to_vec(), &creds);
         runtime.block_on(put_future).unwrap();
@@ -349,5 +343,74 @@ mod test {
         let result = runtime.block_on(get_future).unwrap();
 
         assert_eq!(b"barbell".to_vec(), result);
+    }
+
+    #[tokio::test]
+    async fn get_cache_hit() -> Result<()> {
+        let server = MockServer::start().await;
+        let base_url = format!("{}/", server.uri());
+        let credentials =
+            AzureCredentials::new(&base_url, "account name", None, String::from("container"));
+        let container = HttpBlobContainer::new(&base_url, credentials.blob_container_name())?;
+
+        let body = b"hello".to_vec();
+        Mock::given(method("GET"))
+            .and(path("/container/foo/bar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = container.get("foo/bar", &credentials).await?;
+        assert_eq!(result, body);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_cache_miss() -> Result<()> {
+        let server = MockServer::start().await;
+        let base_url = format!("{}/", server.uri());
+        let credentials =
+            AzureCredentials::new(&base_url, "account name", None, String::from("container"));
+        let container = HttpBlobContainer::new(&base_url, credentials.blob_container_name())?;
+
+        Mock::given(method("GET"))
+            .and(path("/container/foo/bar"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = container.get("foo/bar", &credentials).await;
+        match result {
+            Err(e) => match e.downcast::<BadHttpStatusError>() {
+                Ok(_) => Ok(()),
+                Err(e) => bail!("Result is not an Err(BadHttpStatusError): {}", e),
+            },
+            x => bail!("Result {:?} is not an Err(BadHttpStatusError)", x),
+        }
+    }
+
+    #[tokio::test]
+    async fn put() -> Result<()> {
+        let server = MockServer::start().await;
+        let base_url = format!("{}/", server.uri());
+        let credentials =
+            AzureCredentials::new(&base_url, "account name", None, String::from("container"));
+        let container = HttpBlobContainer::new(&base_url, credentials.blob_container_name())?;
+
+        let body = b"hello".to_vec();
+        Mock::given(method("PUT"))
+            .and(path("/container/foo/bar"))
+            .and(body_bytes(body.clone()))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        container.put("foo/bar", body, &credentials).await?;
+
+        Ok(())
     }
 }
