@@ -63,7 +63,9 @@ pub mod util;
 
 use std::env;
 
-const LOGGING_ENV: &str = "SCCACHE_LOG";
+/// Used to denote the environment variable that controls
+/// logging for sccache, and sccache-dist.
+pub const LOGGING_ENV: &str = "SCCACHE_LOG";
 
 pub fn main() {
     init_logging();
@@ -94,7 +96,7 @@ fn init_logging() {
     if env::var(LOGGING_ENV).is_ok() {
         match env_logger::Builder::from_env(LOGGING_ENV).try_init() {
             Ok(_) => (),
-            Err(e) => panic!("Failed to initalize logging: {:?}", e),
+            Err(e) => panic!("Failed to initialize logging: {:?}", e),
         }
     }
 }
