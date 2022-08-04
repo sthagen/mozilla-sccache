@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{CCompilerImpl, CCompilerKind, Language, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDesciptor, CCompilerImpl, CCompilerKind, Language, ParsedArguments,
+};
 use crate::compiler::{
     clang, gcc, write_temp_file, Cacheable, ColorMode, CompileCommand, CompilerArguments,
 };
@@ -443,6 +445,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("w4", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("wd", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("we", OsString, Concatenated, PassThroughWithSuffix),
+    msvc_take_arg!("winsysroot", PathBuf, CanBeSeparated, PassThroughWithPath),
     msvc_take_arg!("wo", OsString, Concatenated, PassThroughWithSuffix),
     take_arg!("@", PathBuf, Concatenated, TooHardPath),
 ]);
@@ -661,13 +664,31 @@ pub fn parse_arguments(
     match output_arg {
         // If output file name is not given, use default naming rule
         None => {
-            outputs.insert("obj", Path::new(&input).with_extension("obj"));
+            outputs.insert(
+                "obj",
+                ArtifactDesciptor {
+                    path: Path::new(&input).with_extension("obj"),
+                    optional: false,
+                },
+            );
         }
         Some(o) => {
             if o.extension().is_none() && compilation {
-                outputs.insert("obj", o.with_extension("obj"));
+                outputs.insert(
+                    "obj",
+                    ArtifactDesciptor {
+                        path: o.with_extension("obj"),
+                        optional: false,
+                    },
+                );
             } else {
-                outputs.insert("obj", o);
+                outputs.insert(
+                    "obj",
+                    ArtifactDesciptor {
+                        path: o,
+                        optional: false,
+                    },
+                );
             }
         }
     }
@@ -675,7 +696,13 @@ pub fn parse_arguments(
     // Clang is currently unable to generate PDB files
     if debug_info && !is_clang {
         match pdb {
-            Some(p) => outputs.insert("pdb", p),
+            Some(p) => outputs.insert(
+                "pdb",
+                ArtifactDesciptor {
+                    path: p,
+                    optional: false,
+                },
+            ),
             None => {
                 // -Zi and -ZI without -Fd defaults to vcxxx.pdb (where xxx depends on the
                 // MSVC version), and that's used for all compilations with the same
@@ -793,9 +820,9 @@ where
     let output = run_input_output(cmd, None).await?;
 
     let parsed_args = &parsed_args;
-    if let (Some(ref objfile), &Some(ref depfile)) =
-        (parsed_args.outputs.get("obj"), &parsed_args.depfile)
+    if let (Some(obj), &Some(ref depfile)) = (parsed_args.outputs.get("obj"), &parsed_args.depfile)
     {
+        let objfile = &obj.path;
         let f = File::create(cwd.join(depfile))?;
         let mut f = BufWriter::new(f);
 
@@ -863,7 +890,7 @@ fn generate_compile_commands(
 
     trace!("compile");
     let out_file = match parsed_args.outputs.get("obj") {
-        Some(obj) => obj,
+        Some(obj) => &obj.path,
         None => bail!("Missing object file output"),
     };
 
@@ -874,7 +901,7 @@ fn generate_compile_commands(
         .map_or(Cacheable::Yes, |pdb| {
             // If the PDB exists, we don't know if it's shared with another
             // compilation. If it is, we can't cache.
-            if Path::new(&cwd).join(pdb).exists() {
+            if Path::new(&cwd).join(pdb.path.clone()).exists() {
                 Cacheable::No
             } else {
                 Cacheable::Yes
@@ -987,7 +1014,16 @@ mod test {
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
         assert_eq!(Some("-c"), compilation_flag.to_str());
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert!(preprocessor_args.is_empty());
         assert!(common_args.is_empty());
         assert!(!msvc_show_includes);
@@ -1012,7 +1048,16 @@ mod test {
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
         assert_eq!(Some("/c"), compilation_flag.to_str());
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert!(preprocessor_args.is_empty());
         assert!(common_args.is_empty());
         assert!(!msvc_show_includes);
@@ -1035,7 +1080,16 @@ mod test {
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert!(preprocessor_args.is_empty());
         assert!(common_args.is_empty());
         assert!(!msvc_show_includes);
@@ -1058,7 +1112,16 @@ mod test {
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert!(preprocessor_args.is_empty());
         assert!(common_args.is_empty());
         assert!(!msvc_show_includes);
@@ -1141,7 +1204,16 @@ mod test {
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert!(preprocessor_args.is_empty());
         assert_eq!(common_args, ovec!["-foo", "-bar"]);
         assert!(!msvc_show_includes);
@@ -1157,7 +1229,8 @@ mod test {
             "-imsvc",
             "/a/b/c",
             "-Fofoo.obj",
-            "/showIncludes"
+            "/showIncludes",
+            "/winsysroot../../some/dir"
         ];
         let ParsedArguments {
             input,
@@ -1174,10 +1247,19 @@ mod test {
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert_eq!(preprocessor_args, ovec!["-FIfile", "-imsvc/a/b/c"]);
         assert_eq!(dependency_args, ovec!["/showIncludes"]);
-        assert!(common_args.is_empty());
+        assert_eq!(common_args, ovec!["/winsysroot../../some/dir"]);
         assert!(msvc_show_includes);
     }
 
@@ -1200,8 +1282,20 @@ mod test {
         assert_eq!(Language::C, language);
         assert_map_contains!(
             outputs,
-            ("obj", PathBuf::from("foo.obj")),
-            ("pdb", PathBuf::from("foo.pdb"))
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            ),
+            (
+                "pdb",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.pdb"),
+                    optional: false
+                }
+            )
         );
         assert!(preprocessor_args.is_empty());
         assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
@@ -1235,7 +1329,16 @@ mod test {
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
-        assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+        assert_map_contains!(
+            outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            )
+        );
         assert_eq!(1, outputs.len());
         assert!(preprocessor_args.is_empty());
         assert_eq!(
@@ -1276,7 +1379,16 @@ mod test {
             };
             assert_eq!(Some("foo.c"), input.to_str());
             assert_eq!(Language::C, language);
-            assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+            assert_map_contains!(
+                outputs,
+                (
+                    "obj",
+                    ArtifactDesciptor {
+                        path: PathBuf::from("foo.obj"),
+                        optional: false
+                    }
+                )
+            );
             assert_eq!(1, outputs.len());
             assert!(preprocessor_args.is_empty());
             assert_eq!(
@@ -1390,7 +1502,15 @@ mod test {
             language: Language::C,
             compilation_flag: "-c".into(),
             depfile: None,
-            outputs: vec![("obj", "foo.obj".into())].into_iter().collect(),
+            outputs: vec![(
+                "obj",
+                ArtifactDesciptor {
+                    path: "foo.obj".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
             dependency_args: vec![],
             preprocessor_args: vec![],
             common_args: vec![],
@@ -1432,9 +1552,24 @@ mod test {
             language: Language::C,
             compilation_flag: "/c".into(),
             depfile: None,
-            outputs: vec![("obj", "foo.obj".into()), ("pdb", pdb)]
-                .into_iter()
-                .collect(),
+            outputs: vec![
+                (
+                    "obj",
+                    ArtifactDesciptor {
+                        path: "foo.obj".into(),
+                        optional: false,
+                    },
+                ),
+                (
+                    "pdb",
+                    ArtifactDesciptor {
+                        path: pdb,
+                        optional: false,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
             dependency_args: vec![],
             preprocessor_args: vec![],
             common_args: vec![],

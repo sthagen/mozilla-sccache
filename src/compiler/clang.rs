@@ -15,13 +15,15 @@
 #![allow(unused_imports, dead_code, unused_variables)]
 
 use crate::compiler::args::*;
-use crate::compiler::c::{CCompilerImpl, CCompilerKind, Language, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDesciptor, CCompilerImpl, CCompilerKind, Language, ParsedArguments,
+};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{gcc, write_temp_file, Cacheable, CompileCommand, CompilerArguments};
 use crate::dist;
 use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
-use semver::Version;
+use semver::{BuildMetadata, Prerelease, Version};
 use std::ffi::OsString;
 use std::fs::File;
 use std::future::Future;
@@ -69,8 +71,8 @@ impl Clang {
                 major,
                 minor: 0,
                 patch: 0,
-                pre: vec![],
-                build: vec![],
+                pre: Prerelease::default(),
+                build: BuildMetadata::default(),
             })
     }
 }
@@ -189,6 +191,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-plugin-arg", OsString, Concatenated('-'), PassThrough),
     take_arg!("-target", OsString, Separated, PassThrough),
     flag!("-verify", PreprocessorArgumentFlag),
+    take_arg!("/winsysroot", PathBuf, CanBeSeparated, PassThroughPath),
 ]);
 
 // Maps the `-fprofile-use` argument to the actual path of the
@@ -247,7 +250,16 @@ mod test {
         let a = parses!("-c", "foo.c", "-o", "foo.o");
         assert_eq!(Some("foo.c"), a.input.to_str());
         assert_eq!(Language::C, a.language);
-        assert_map_contains!(a.outputs, ("obj", PathBuf::from("foo.o")));
+        assert_map_contains!(
+            a.outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.o"),
+                    optional: false
+                }
+            )
+        );
         assert!(a.preprocessor_args.is_empty());
         assert!(a.common_args.is_empty());
     }
@@ -255,14 +267,36 @@ mod test {
     #[test]
     fn test_parse_arguments_values() {
         let a = parses!(
-            "-c", "foo.cxx", "-arch", "xyz", "-fabc", "-I", "include", "-o", "foo.o", "-include",
-            "file"
+            "-c",
+            "foo.cxx",
+            "-arch",
+            "xyz",
+            "-fabc",
+            "-I",
+            "include",
+            "-o",
+            "foo.o",
+            "-include",
+            "file",
+            "/winsysroot../some/dir"
         );
         assert_eq!(Some("foo.cxx"), a.input.to_str());
         assert_eq!(Language::Cxx, a.language);
-        assert_map_contains!(a.outputs, ("obj", PathBuf::from("foo.o")));
+        assert_map_contains!(
+            a.outputs,
+            (
+                "obj",
+                ArtifactDesciptor {
+                    path: PathBuf::from("foo.o"),
+                    optional: false
+                }
+            )
+        );
         assert_eq!(ovec!["-Iinclude", "-include", "file"], a.preprocessor_args);
-        assert_eq!(ovec!["-arch", "xyz", "-fabc"], a.common_args);
+        assert_eq!(
+            ovec!["-arch", "xyz", "-fabc", "/winsysroot", "../some/dir"],
+            a.common_args
+        );
     }
 
     #[test]
