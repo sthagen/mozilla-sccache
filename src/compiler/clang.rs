@@ -16,13 +16,13 @@
 
 use crate::compiler::args::*;
 use crate::compiler::c::{
-    ArtifactDesciptor, CCompilerImpl, CCompilerKind, Language, ParsedArguments,
+    ArtifactDescriptor, CCompilerImpl, CCompilerKind, Language, ParsedArguments,
 };
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{gcc, write_temp_file, Cacheable, CompileCommand, CompilerArguments};
-use crate::dist;
 use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
 use crate::util::{run_input_output, OsStrExt};
+use crate::{counted_array, dist};
 use semver::{BuildMetadata, Prerelease, Version};
 use std::ffi::OsString;
 use std::fs::File;
@@ -254,7 +254,7 @@ mod test {
             a.outputs,
             (
                 "obj",
-                ArtifactDesciptor {
+                ArtifactDescriptor {
                     path: PathBuf::from("foo.o"),
                     optional: false
                 }
@@ -286,7 +286,7 @@ mod test {
             a.outputs,
             (
                 "obj",
-                ArtifactDesciptor {
+                ArtifactDescriptor {
                     path: PathBuf::from("foo.o"),
                     optional: false
                 }

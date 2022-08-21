@@ -28,9 +28,8 @@ bincode = "1"
 blake3 = "1"
 byteorder = "1.0"
 bytes = "1"
-chrono = { version = "0.4.21", optional = true }
+chrono = { version = "0.4.22", optional = true }
 clap = "2.23.0"
-counted-array = "0.1"
 directories = "4.0.1"
 env_logger = "0.9"
 filetime = "0.2"
@@ -45,7 +44,7 @@ hyperx = { version = "1.0", optional = true }
 jobserver = "0.1"
 jsonwebtoken = { version = "8", optional = true }
 lazy_static = "1.0.0"
-libc = "0.2.129"
+libc = "0.2.132"
 linked-hash-map = "0.5"
 local-encoding = "0.2.0"
 log = "0.4"
@@ -86,7 +85,7 @@ zstd = "0.11"
 # dist-server only
 crossbeam-utils = { version = "0.8", optional = true }
 libmount = { version = "0.1.10", optional = true }
-nix = { version = "0.24.2", optional = true }
+nix = { version = "0.25.0", optional = true }
 rouille = { version = "3.5", optional = true, default-features = false, features = ["ssl"] }
 syslog = { version = "6", optional = true }
 void = { version = "1", optional = true }

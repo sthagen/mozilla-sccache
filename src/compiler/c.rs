@@ -60,7 +60,7 @@ where
     compiler: I,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Language {
     C,
     Cxx,
@@ -70,8 +70,8 @@ pub enum Language {
 }
 
 /// Artifact produced by a C/C++ compiler.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ArtifactDesciptor {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactDescriptor {
     /// Path to the artifact.
     pub path: PathBuf,
     /// Whether the artifact is an optional object file.
@@ -80,7 +80,7 @@ pub struct ArtifactDesciptor {
 
 /// The results of parsing a compiler commandline.
 #[allow(dead_code)]
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ParsedArguments {
     /// The input source file.
     pub input: PathBuf,
@@ -91,7 +91,7 @@ pub struct ParsedArguments {
     /// The file in which to generate dependencies.
     pub depfile: Option<PathBuf>,
     /// Output files and whether it's optional, keyed by a simple name, like "obj".
-    pub outputs: HashMap<&'static str, ArtifactDesciptor>,
+    pub outputs: HashMap<&'static str, ArtifactDescriptor>,
     /// Commandline arguments for dependency generation.
     pub dependency_args: Vec<OsString>,
     /// Commandline arguments for the preprocessor (not including common_args).
@@ -166,7 +166,7 @@ struct CCompilation<I: CCompilerImpl> {
 }
 
 /// Supported C compilers.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CCompilerKind {
     /// GCC
     Gcc,
@@ -178,6 +178,8 @@ pub enum CCompilerKind {
     Msvc,
     /// NVIDIA cuda compiler
     Nvcc,
+    /// Tasking VX
+    TaskingVX,
 }
 
 /// An interface to a specific C compiler.
