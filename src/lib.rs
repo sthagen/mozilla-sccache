@@ -18,8 +18,6 @@
 
 #[macro_use]
 extern crate async_trait;
-#[macro_use]
-extern crate clap;
 #[cfg(feature = "jsonwebtoken")]
 use jsonwebtoken as jwt;
 #[macro_use]
@@ -67,25 +65,30 @@ pub const LOGGING_ENV: &str = "SCCACHE_LOG";
 
 pub fn main() {
     init_logging();
-    std::process::exit(match cmdline::parse() {
-        Ok(cmd) => match commands::run_command(cmd) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("sccache: error: {}", e);
-                for e in e.chain().skip(1) {
-                    eprintln!("sccache: caused by: {}", e);
+
+    let command = match cmdline::try_parse() {
+        Ok(cmd) => cmd,
+        Err(e) => match e.downcast::<clap::error::Error>() {
+            // If the error is from clap then let them handle formatting and exiting
+            Ok(clap_err) => clap_err.exit(),
+            Err(some_other_err) => {
+                println!("sccache: {some_other_err}");
+                for source in some_other_err.chain().skip(1) {
+                    println!("sccache: caused by: {source}");
                 }
-                2
+                std::process::exit(1);
             }
         },
+    };
+
+    std::process::exit(match commands::run_command(command) {
+        Ok(s) => s,
         Err(e) => {
-            println!("sccache: {}", e);
+            eprintln!("sccache: error: {}", e);
             for e in e.chain().skip(1) {
-                println!("sccache: caused by: {}", e);
+                eprintln!("sccache: caused by: {}", e);
             }
-            cmdline::get_app().print_help().unwrap();
-            println!();
-            1
+            2
         }
     });
 }
