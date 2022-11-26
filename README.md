@@ -1,6 +1,6 @@
 [![Build Status](https://github.com/mozilla/sccache/workflows/ci/badge.svg)](https://github.com/mozilla/sccache/actions?query=workflow%3Aci)
 [![Crates.io](https://img.shields.io/crates/v/sccache.svg)](https://crates.io/crates/sccache)
-[![Matrix](https://img.shields.io/matrix/#sccache:mozilla.org)](https://chat.mozilla.org/#/room/#sccache:mozilla.org)
+[![Matrix](https://img.shields.io/matrix/sccache:mozilla.org)](https://chat.mozilla.org/#/room/#sccache:mozilla.org)
 ![Crates.io](https://img.shields.io/crates/l/sccache)
 [![dependency status](https://deps.rs/repo/github/mozilla/sccache/status.svg)](https://deps.rs/repo/github/mozilla/sccache)
 
@@ -192,9 +192,13 @@ The local storage only supports a single sccache server at a time. Multiple conc
 ### S3
 If you want to use S3 storage for the sccache cache, you need to set the `SCCACHE_BUCKET` environment variable to the name of the S3 bucket to use.
 
-You can use `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to set the S3 credentials.  Alternately, you can set `AWS_IAM_CREDENTIALS_URL` to a URL that returns credentials in the format supported by the [EC2 metadata service](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#instance-metadata-security-credentials), and credentials will be fetched from that location as needed. In the absence of either of these options, credentials for the instance's IAM role will be fetched from the EC2 metadata service directly.
+Credentials are resolved using the default AWS provider chain, including the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables, the `~/.aws/credentials` file, etc. For more details see https://docs.aws.amazon.com/sdk-for-rust/latest/dg/credentials.html. If multiple profiles are available, you can pick one using the `AWS_PROFILE` environment variable.
 
-If you need to override the default endpoint you can set `SCCACHE_ENDPOINT`. To connect to a minio storage for example you can set `SCCACHE_ENDPOINT=<ip>:<port>`. If your endpoint requires TLS, set `SCCACHE_S3_USE_SSL=true`.
+If you do not want to use credentials at all, you can set the `SCCACHE_S3_NO_CREDENTIALS` environment variable. This requires the bucket to allow public readonly access, and can be useful to implement a readonly cache for pull requests, which typically can't be given access to credentials for security reasons.
+
+You can configure the region using the `SCCACHE_REGION` environment variable, or specify the `region` key in `~/.aws/credentials`. Alternatively you can specify the endpoint URL using the `SCCACHE_ENDPOINT` environment variable. To connect to a minio storage for example you can set `SCCACHE_ENDPOINT=<ip>:<port>`. 
+
+If your endpoint requires HTTPS/TLS, set `SCCACHE_S3_USE_SSL=true`. If you don't need a secure network layer, HTTP (`SCCACHE_S3_USE_SSL=false`) might be better for performance.
 
 You can also define a prefix that will be prepended to the keys of all cache objects created and read within the S3 bucket, effectively creating a scope. To do that use the `SCCACHE_S3_KEY_PREFIX` environment variable. This can be useful when sharing a bucket with another application.
 
@@ -218,6 +222,20 @@ If you're using authentication, either:
 By default, SCCACHE on GCS will be read-only. To change this, set `SCCACHE_GCS_RW_MODE` to either `READ_ONLY` or `READ_WRITE`.
 
 You can also define a prefix that will be prepended to the keys of all cache objects created and read within the GCS bucket, effectively creating a scope. To do that use the `SCCACHE_GCS_KEY_PREFIX` environment variable. This can be useful when sharing a bucket with another application.
+
+To create such account, in GCP, go in `APIs and Services` => `Cloud Storage` => `Create credentials` => `Service account`. Then, once created, click on the account then `Keys` => `Add key` => `Create new key`. Select the JSON format and here it is. This JSON file is what `SCCACHE_GCS_KEY_PATH` expects.
+The service account needs `Storage Object Admin` permissions on the bucket (otherwise, sccache will fail with a simple `Permission denied`).
+
+To verify that it works, run:
+
+```
+export SCCACHE_GCS_BUCKET=<bucket name in GCP>
+export SCCACHE_GCS_KEY_PATH=secret-gcp-storage.json
+./sccache --show-stats
+# you should see
+[...]
+Cache location                  GCS, bucket: Bucket(name=<bucket name in GCP>), key_prefix: (none)
+```
 
 ### Azure
 To use Azure Blob Storage, you'll need your Azure connection string and an _existing_ Blob Storage container name.  Set the `SCCACHE_AZURE_CONNECTION_STRING`

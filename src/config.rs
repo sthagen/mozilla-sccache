@@ -18,6 +18,8 @@ use serde::de::{Deserialize, DeserializeOwned, Deserializer};
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 use serde::ser::{Serialize, Serializer};
+#[cfg(test)]
+use serial_test::serial;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -201,9 +203,11 @@ pub struct RedisCacheConfig {
 #[serde(deny_unknown_fields)]
 pub struct S3CacheConfig {
     pub bucket: String,
-    pub endpoint: String,
-    pub use_ssl: bool,
+    pub region: Option<String>,
     pub key_prefix: String,
+    pub no_credentials: bool,
+    pub endpoint: Option<String>,
+    pub use_ssl: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -452,19 +456,12 @@ pub struct EnvConfig {
 fn config_from_env() -> Result<EnvConfig> {
     // ======= AWS =======
     let s3 = env::var("SCCACHE_BUCKET").ok().map(|bucket| {
-        let endpoint = match env::var("SCCACHE_ENDPOINT") {
-            Ok(endpoint) => format!("{}/{}", endpoint, bucket),
-            _ => match env::var("SCCACHE_REGION") {
-                Ok(ref region) if region != "us-east-1" => {
-                    format!("{}.s3-{}.amazonaws.com", bucket, region)
-                }
-                _ => format!("{}.s3.amazonaws.com", bucket),
-            },
-        };
+        let region = env::var("SCCACHE_REGION").ok();
+        let no_credentials = env::var("SCCACHE_S3_NO_CREDENTIALS").ok().is_some();
         let use_ssl = env::var("SCCACHE_S3_USE_SSL")
             .ok()
-            .filter(|value| value != "off")
-            .is_some();
+            .map(|value| value != "off");
+        let endpoint = env::var("SCCACHE_ENDPOINT").ok();
         let key_prefix = env::var("SCCACHE_S3_KEY_PREFIX")
             .ok()
             .as_ref()
@@ -475,11 +472,19 @@ fn config_from_env() -> Result<EnvConfig> {
 
         S3CacheConfig {
             bucket,
+            region,
+            no_credentials,
+            key_prefix,
             endpoint,
             use_ssl,
-            key_prefix,
         }
     });
+    if s3.as_ref().map(|s3| s3.no_credentials).unwrap_or_default()
+        && (env::var_os("AWS_ACCESS_KEY_ID").is_some()
+            || env::var_os("AWS_SECRET_ACCESS_KEY").is_some())
+    {
+        bail!("If setting S3 credentials, SCCACHE_S3_NO_CREDENTIALS must not be set.");
+    }
 
     // ======= redis =======
     let redis = env::var("SCCACHE_REDIS")
@@ -910,6 +915,26 @@ fn config_overrides() {
 }
 
 #[test]
+#[serial]
+fn test_s3_no_credentials() {
+    env::set_var("SCCACHE_S3_NO_CREDENTIALS", "1");
+    env::set_var("SCCACHE_BUCKET", "my-bucket");
+    env::set_var("AWS_ACCESS_KEY_ID", "aws-access-key-id");
+    env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret-access-key");
+
+    let error = config_from_env().unwrap_err();
+    assert_eq!(
+        "If setting S3 credentials, SCCACHE_S3_NO_CREDENTIALS must not be set.",
+        error.to_string()
+    );
+
+    env::remove_var("SCCACHE_S3_NO_CREDENTIALS");
+    env::remove_var("SCCACHE_BUCKET");
+    env::remove_var("AWS_ACCESS_KEY_ID");
+    env::remove_var("AWS_SECRET_ACCESS_KEY");
+}
+
+#[test]
 fn test_gcs_credentials_url() {
     env::set_var("SCCACHE_GCS_BUCKET", "my-bucket");
     env::set_var("SCCACHE_GCS_CREDENTIALS_URL", "http://localhost/");
@@ -1000,9 +1025,11 @@ url = "redis://user:passwd@1.2.3.4:6379/1"
 
 [cache.s3]
 bucket = "name"
+region = "us-east-2"
 endpoint = "s3-us-east-1.amazonaws.com"
 use_ssl = true
 key_prefix = "s3prefix"
+no_credentials = true
 "#;
 
     let file_config: FileConfig = toml::from_str(CONFIG_STR).expect("Is valid toml.");
@@ -1031,9 +1058,11 @@ key_prefix = "s3prefix"
                 }),
                 s3: Some(S3CacheConfig {
                     bucket: "name".to_owned(),
-                    endpoint: "s3-us-east-1.amazonaws.com".to_owned(),
-                    use_ssl: true,
-                    key_prefix: "s3prefix".into()
+                    region: Some("us-east-2".to_owned()),
+                    endpoint: Some("s3-us-east-1.amazonaws.com".to_owned()),
+                    use_ssl: Some(true),
+                    key_prefix: "s3prefix".into(),
+                    no_credentials: true,
                 }),
             },
             dist: DistConfig {
