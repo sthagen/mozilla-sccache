@@ -146,6 +146,8 @@ impl HTTPUrl {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AzureCacheConfig {
+    pub connection_string: String,
+    pub container: String,
     pub key_prefix: String,
 }
 
@@ -181,9 +183,8 @@ pub enum GCSCacheRWMode {
 pub struct GCSCacheConfig {
     pub bucket: String,
     pub key_prefix: String,
-    pub cred_path: Option<PathBuf>,
-    pub oauth_url: Option<String>,
-    pub deprecated_url: Option<String>,
+    pub cred_path: Option<String>,
+    pub service_account: Option<String>,
     pub rw_mode: GCSCacheRWMode,
 }
 
@@ -431,6 +432,7 @@ impl Default for DistConfig {
 pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
+    pub server_startup_timeout_ms: Option<u64>,
 }
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
@@ -532,20 +534,19 @@ fn config_from_env() -> Result<EnvConfig> {
             .filter(|s| !s.is_empty())
             .unwrap_or_default()
             .to_owned();
-        let deprecated_url = env::var("SCCACHE_GCS_CREDENTIALS_URL").ok();
-        let oauth_url = env::var("SCCACHE_GCS_OAUTH_URL").ok();
-        let cred_path = env::var_os("SCCACHE_GCS_KEY_PATH").map(PathBuf::from);
 
-        if oauth_url.is_some() && cred_path.is_some() {
-            warn!("Both SCCACHE_GCS_OAUTH_URL and SCCACHE_GCS_KEY_PATH are set");
-            warn!("You should set only one of them!");
-            warn!("SCCACHE_GCS_KEY_PATH will take precedence");
+        if env::var("SCCACHE_GCS_CREDENTIALS_URL").is_ok() {
+            warn!("gcs deprecated_url has been deprecated");
         }
-        if let Some(p) = &cred_path {
-            if !p.is_file() {
-                warn!("Could not find SCCACHE_GCS_KEY_PATH file '{:?}'", p);
-            }
+
+        if env::var("SCCACHE_GCS_OAUTH_URL").is_ok() {
+            warn!("SCCACHE_GCS_OAUTH_URL has been deprecated");
+            warn!("if you intend to use vm metadata for auth, please set correct service account intead");
         }
+
+        let cred_path = env::var("SCCACHE_GCS_KEY_PATH").ok();
+        let service_account = env::var("SCCACHE_GCS_SERVICE_ACCOUNT").ok();
+
         let rw_mode = match env::var("SCCACHE_GCS_RW_MODE").as_ref().map(String::as_str) {
             Ok("READ_ONLY") => GCSCacheRWMode::ReadOnly,
             Ok("READ_WRITE") => GCSCacheRWMode::ReadWrite,
@@ -560,12 +561,12 @@ fn config_from_env() -> Result<EnvConfig> {
                 GCSCacheRWMode::ReadOnly
             }
         };
+
         GCSCacheConfig {
             bucket,
             key_prefix,
             cred_path,
-            oauth_url,
-            deprecated_url,
+            service_account,
             rw_mode,
         }
     });
@@ -590,7 +591,10 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     // ======= Azure =======
-    let azure = env::var("SCCACHE_AZURE_CONNECTION_STRING").ok().map(|_| {
+    let azure = if let (Ok(connection_string), Ok(container)) = (
+        env::var("SCCACHE_AZURE_CONNECTION_STRING"),
+        env::var("SCCACHE_AZURE_BLOB_CONTAINER"),
+    ) {
         let key_prefix = env::var("SCCACHE_AZURE_KEY_PREFIX")
             .ok()
             .as_ref()
@@ -598,8 +602,14 @@ fn config_from_env() -> Result<EnvConfig> {
             .filter(|s| !s.is_empty())
             .unwrap_or_default()
             .to_owned();
-        AzureCacheConfig { key_prefix }
-    });
+        Some(AzureCacheConfig {
+            connection_string,
+            container,
+            key_prefix,
+        })
+    } else {
+        None
+    };
 
     // ======= Local =======
     let disk_dir = env::var_os("SCCACHE_DIR").map(PathBuf::from);
@@ -657,10 +667,11 @@ pub struct Config {
     pub caches: Vec<CacheType>,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
+    pub server_startup_timeout: Option<std::time::Duration>,
 }
 
 impl Config {
-    pub fn load() -> Result<Config> {
+    pub fn load() -> Result<Self> {
         let env_conf = config_from_env()?;
 
         let file_conf_path = config_file("SCCACHE_CONF", "config");
@@ -668,23 +679,31 @@ impl Config {
             .context("Failed to load config file")?
             .unwrap_or_default();
 
-        Ok(Config::from_env_and_file_configs(env_conf, file_conf))
+        Ok(Self::from_env_and_file_configs(env_conf, file_conf))
     }
 
-    fn from_env_and_file_configs(env_conf: EnvConfig, file_conf: FileConfig) -> Config {
+    fn from_env_and_file_configs(env_conf: EnvConfig, file_conf: FileConfig) -> Self {
         let mut conf_caches: CacheConfigs = Default::default();
 
-        let FileConfig { cache, dist } = file_conf;
+        let FileConfig {
+            cache,
+            dist,
+            server_startup_timeout_ms,
+        } = file_conf;
         conf_caches.merge(cache);
+
+        let server_startup_timeout =
+            server_startup_timeout_ms.map(std::time::Duration::from_millis);
 
         let EnvConfig { cache } = env_conf;
         conf_caches.merge(cache);
 
         let (caches, fallback_cache) = conf_caches.into_vec_and_fallback();
-        Config {
+        Self {
             caches,
             fallback_cache,
             dist,
+            server_startup_timeout,
         }
     }
 }
@@ -841,6 +860,30 @@ pub mod server {
         TEN_GIGS
     }
 
+    const DEFAULT_POT_CLONE_FROM: &str = "sccache-template";
+    const DEFAULT_POT_FS_ROOT: &str = "/opt/pot";
+    const DEFAULT_POT_CMD: &str = "pot";
+    const DEFAULT_POT_CLONE_ARGS: &[&str] = &["-i", "lo0|127.0.0.2"];
+
+    fn default_pot_clone_from() -> String {
+        DEFAULT_POT_CLONE_FROM.to_string()
+    }
+
+    fn default_pot_fs_root() -> PathBuf {
+        DEFAULT_POT_FS_ROOT.into()
+    }
+
+    fn default_pot_cmd() -> PathBuf {
+        DEFAULT_POT_CMD.into()
+    }
+
+    fn default_pot_clone_args() -> Vec<String> {
+        DEFAULT_POT_CLONE_ARGS
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
@@ -851,6 +894,17 @@ pub mod server {
         Overlay {
             build_dir: PathBuf,
             bwrap_path: PathBuf,
+        },
+        #[serde(rename = "pot")]
+        Pot {
+            #[serde(default = "default_pot_fs_root")]
+            pot_fs_root: PathBuf,
+            #[serde(default = "default_pot_clone_from")]
+            clone_from: String,
+            #[serde(default = "default_pot_cmd")]
+            pot_cmd: PathBuf,
+            #[serde(default = "default_pot_clone_args")]
+            pot_clone_args: Vec<String>,
         },
     }
 
@@ -898,7 +952,9 @@ fn config_overrides() {
     let env_conf = EnvConfig {
         cache: CacheConfigs {
             azure: Some(AzureCacheConfig {
-                key_prefix: "".to_owned(),
+                connection_string: String::new(),
+                container: String::new(),
+                key_prefix: String::new(),
             }),
             disk: Some(DiskCacheConfig {
                 dir: "/env-cache".into(),
@@ -926,6 +982,7 @@ fn config_overrides() {
             ..Default::default()
         },
         dist: Default::default(),
+        server_startup_timeout_ms: None,
     };
 
     assert_eq!(
@@ -939,7 +996,9 @@ fn config_overrides() {
                     url: "memurl".to_owned()
                 }),
                 CacheType::Azure(AzureCacheConfig {
-                    key_prefix: "".to_owned()
+                    connection_string: String::new(),
+                    container: String::new(),
+                    key_prefix: String::new()
                 }),
             ],
             fallback_cache: DiskCacheConfig {
@@ -947,6 +1006,7 @@ fn config_overrides() {
                 size: 5,
             },
             dist: Default::default(),
+            server_startup_timeout: None,
         }
     );
 }
@@ -972,58 +1032,36 @@ fn test_s3_no_credentials() {
 }
 
 #[test]
-fn test_gcs_credentials_url() {
+fn test_gcs_service_account() {
     env::set_var("SCCACHE_GCS_BUCKET", "my-bucket");
-    env::set_var("SCCACHE_GCS_CREDENTIALS_URL", "http://localhost/");
+    env::set_var("SCCACHE_GCS_SERVICE_ACCOUNT", "my@example.com");
     env::set_var("SCCACHE_GCS_RW_MODE", "READ_WRITE");
 
     let env_cfg = config_from_env().unwrap();
     match env_cfg.cache.gcs {
         Some(GCSCacheConfig {
             ref bucket,
-            ref deprecated_url,
+            service_account,
             rw_mode,
             ..
         }) => {
             assert_eq!(bucket, "my-bucket");
-            match deprecated_url {
-                Some(ref url) => assert_eq!(url, "http://localhost/"),
-                None => panic!("URL can't be none"),
-            };
+            assert_eq!(service_account, Some("my@example.com".to_string()));
             assert_eq!(rw_mode, GCSCacheRWMode::ReadWrite);
         }
         None => unreachable!(),
     };
-}
 
-#[test]
-fn test_gcs_oauth_url() {
-    env::set_var("SCCACHE_GCS_BUCKET", "my-bucket");
-    env::set_var("SCCACHE_GCS_OAUTH_URL", "http://localhost/");
-    env::set_var("SCCACHE_GCS_RW_MODE", "READ_WRITE");
-
-    let env_cfg = config_from_env().unwrap();
-    match env_cfg.cache.gcs {
-        Some(GCSCacheConfig {
-            ref bucket,
-            ref oauth_url,
-            rw_mode,
-            ..
-        }) => {
-            assert_eq!(bucket, "my-bucket");
-            match oauth_url {
-                Some(ref url) => assert_eq!(url, "http://localhost/"),
-                None => panic!("URL can't be none"),
-            };
-            assert_eq!(rw_mode, GCSCacheRWMode::ReadWrite);
-        }
-        None => unreachable!(),
-    };
+    env::remove_var("SCCACHE_GCS_BUCKET");
+    env::remove_var("SCCACHE_GCS_SERVICE_ACCOUNT");
+    env::remove_var("SCCACHE_GCS_RW_MODE");
 }
 
 #[test]
 fn full_toml_parse() {
     const CONFIG_STR: &str = r#"
+server_startup_timeout_ms = 10000
+
 [dist]
 # where to find the scheduler
 scheduler_url = "http://1.2.3.4:10600"
@@ -1046,13 +1084,12 @@ dir = "/tmp/.cache/sccache"
 size = 7516192768 # 7 GiBytes
 
 [cache.gcs]
-# optional url
-deprecated_url = "..."
 rw_mode = "READ_ONLY"
 # rw_mode = "READ_WRITE"
 cred_path = "/psst/secret/cred"
 bucket = "bucket"
 key_prefix = "prefix"
+service_account = "example_service_account"
 
 [cache.gha]
 url = "http://localhost"
@@ -1086,10 +1123,9 @@ no_credentials = true
                     size: 7 * 1024 * 1024 * 1024,
                 }),
                 gcs: Some(GCSCacheConfig {
-                    oauth_url: None,
-                    deprecated_url: Some("...".to_owned()),
                     bucket: "bucket".to_owned(),
-                    cred_path: Some(PathBuf::from("/psst/secret/cred")),
+                    cred_path: Some("/psst/secret/cred".to_string()),
+                    service_account: Some("example_service_account".to_string()),
                     rw_mode: GCSCacheRWMode::ReadOnly,
                     key_prefix: "prefix".into(),
                 }),
@@ -1131,6 +1167,7 @@ no_credentials = true
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
             },
+            server_startup_timeout_ms: Some(10000),
         }
     )
 }
