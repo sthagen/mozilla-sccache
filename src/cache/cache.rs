@@ -335,8 +335,9 @@ impl Storage for opendal::Operator {
                 let hit = CacheRead::from(io::Cursor::new(res))?;
                 Ok(Cache::Hit(hit))
             }
+            Err(e) if e.kind() == opendal::ErrorKind::ObjectNotFound => Ok(Cache::Miss),
             Err(e) => {
-                warn!("Got error: {:?}", e);
+                warn!("Got unexpected error: {:?}", e);
                 Ok(Cache::Miss)
             }
         }
@@ -402,6 +403,7 @@ pub fn storage_from_config(config: &Config, pool: &tokio::runtime::Handle) -> Ar
                 ref cred_path,
                 rw_mode,
                 ref service_account,
+                ref credential_url,
             }) => {
                 debug!(
                     "Trying GCS bucket({}, {}, {:?})",
@@ -420,6 +422,7 @@ pub fn storage_from_config(config: &Config, pool: &tokio::runtime::Handle) -> Ar
                         cred_path.as_deref(),
                         service_account.as_deref(),
                         gcs_read_write_mode,
+                        credential_url.as_deref(),
                     ) {
                         Ok(s) => {
                             trace!("Using GCSCache");
