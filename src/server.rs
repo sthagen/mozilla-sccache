@@ -399,10 +399,46 @@ pub fn start_server(config: &Config, port: u16) -> Result<()> {
         .build()?;
     let pool = runtime.handle().clone();
     let dist_client = DistClientContainer::new(config, &pool);
-    let storage = storage_from_config(config, &pool);
+
+    let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
+
+    let storage = match storage_from_config(config, &pool) {
+        Ok(storage) => storage,
+        Err(err) => {
+            error!("storage init failed for: {err:?}");
+
+            notify_server_startup(
+                &notify,
+                ServerStartup::Err {
+                    reason: err.to_string(),
+                },
+            )?;
+
+            return Err(err);
+        }
+    };
+
+    let cache_mode = runtime.block_on(async {
+        match storage.check().await {
+            Ok(mode) => Ok(mode),
+            Err(err) => {
+                error!("storage check failed for: {err:?}");
+
+                notify_server_startup(
+                    &notify,
+                    ServerStartup::Err {
+                        reason: err.to_string(),
+                    },
+                )?;
+
+                Err(err)
+            }
+        }
+    })?;
+    info!("server has setup with {cache_mode:?}");
+
     let res =
         SccacheServer::<ProcessCommandCreator>::new(port, runtime, client, dist_client, storage);
-    let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
     match res {
         Ok(srv) => {
             let port = srv.port();
@@ -1187,7 +1223,7 @@ where
                                 }
                             }
                             stats.cache_misses.increment(&kind);
-                            stats.cache_read_miss_duration += duration;
+                            stats.compiler_write_duration += duration;
                             cache_write = Some(future);
                         }
                         CompileResult::NotCacheable => {
@@ -1354,7 +1390,7 @@ pub struct ServerStats {
     /// The total time spent reading cache hits.
     pub cache_read_hit_duration: Duration,
     /// The total time spent reading cache misses.
-    pub cache_read_miss_duration: Duration,
+    pub compiler_write_duration: Duration,
     /// The count of compilation failures.
     pub compile_fails: u64,
     /// Counts of reasons why compiles were not cached.
@@ -1404,7 +1440,7 @@ impl Default for ServerStats {
             cache_writes: u64::default(),
             cache_write_duration: Duration::new(0, 0),
             cache_read_hit_duration: Duration::new(0, 0),
-            cache_read_miss_duration: Duration::new(0, 0),
+            compiler_write_duration: Duration::new(0, 0),
             compile_fails: u64::default(),
             not_cached: HashMap::new(),
             dist_compiles: HashMap::new(),
@@ -1492,9 +1528,9 @@ impl ServerStats {
         );
         set_duration_stat!(
             stats_vec,
-            self.cache_read_miss_duration,
+            self.compiler_write_duration,
             self.cache_misses.all(),
-            "Average cache read miss"
+            "Average compiler"
         );
         set_duration_stat!(
             stats_vec,

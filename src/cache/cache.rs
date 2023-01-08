@@ -25,7 +25,16 @@ use crate::cache::memcached::MemcachedCache;
 use crate::cache::redis::RedisCache;
 #[cfg(feature = "s3")]
 use crate::cache::s3::S3Cache;
-use crate::config::{self, CacheType, Config};
+use crate::config::Config;
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3"
+))]
+use crate::config::{self, CacheType};
 use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek, Write};
@@ -95,6 +104,15 @@ impl fmt::Debug for Cache {
             Cache::Recache => write!(f, "Cache::Recache"),
         }
     }
+}
+
+/// CacheMode is used to repreent which mode we are using.
+#[derive(Debug)]
+pub enum CacheMode {
+    /// Only read cache from storage.
+    ReadOnly,
+    /// Full support of cache storage: read and write.
+    ReadWrite,
 }
 
 /// Trait objects can't be bounded by more than one non-builtin trait.
@@ -315,6 +333,22 @@ pub trait Storage: Send + Sync {
     /// finished.
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration>;
 
+    /// Check the cache capability.
+    ///
+    /// - `Ok(CacheMode::ReadOnly)` means cache can only be used to `get`
+    ///   cache.
+    /// - `Ok(CacheMode::ReadWrite)` means cache can do both `get` and `put`.
+    /// - `Err(err)` means cache is not setup correctly or not match with
+    ///   users input (for example, user try to use `ReadWrite` but cache
+    ///   is `ReadOnly`).
+    ///
+    /// We will provide a default implementation which returns
+    /// `Ok(CacheMode::ReadWrite)` for service that doesn't
+    /// support check yet.
+    async fn check(&self) -> Result<CacheMode> {
+        Ok(CacheMode::ReadWrite)
+    }
+
     /// Get the storage location.
     fn location(&self) -> String;
 
@@ -326,7 +360,7 @@ pub trait Storage: Send + Sync {
 }
 
 /// Implement storage for operator.
-#[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
+#[cfg(any(feature = "s3", feature = "azure", feature = "gcs", feature = "redis"))]
 #[async_trait]
 impl Storage for opendal::Operator {
     async fn get(&self, key: &str) -> Result<Cache> {
@@ -353,10 +387,36 @@ impl Storage for opendal::Operator {
         Ok(start.elapsed())
     }
 
+    async fn check(&self) -> Result<CacheMode> {
+        use opendal::ErrorKind;
+
+        let path = ".sccache_check";
+
+        let can_write = match self.object(path).write("Hello, World!").await {
+            Ok(_) => true,
+            Err(err) if err.kind() == ErrorKind::ObjectAlreadyExists => true,
+            Err(err) if err.kind() == ErrorKind::ObjectPermissionDenied => false,
+            Err(err) => bail!("cache storage failed to write: {:?}", err),
+        };
+
+        match self.object(path).read().await {
+            Ok(_) => (),
+            // Read not exist file with not found is ok.
+            Err(err) if err.kind() == ErrorKind::ObjectNotFound => (),
+            Err(err) => bail!("cache storage failed to read: {:?}", err),
+        };
+
+        if can_write {
+            Ok(CacheMode::ReadWrite)
+        } else {
+            Ok(CacheMode::ReadOnly)
+        }
+    }
+
     fn location(&self) -> String {
         let meta = self.metadata();
         format!(
-            "{}, bucket: {}, prefix: {}",
+            "{}, name: {}, prefix: {}",
             meta.scheme(),
             meta.name(),
             meta.root()
@@ -373,30 +433,31 @@ impl Storage for opendal::Operator {
 }
 
 /// Normalize key `abcdef` into `a/b/c/abcdef`
+#[allow(dead_code)]
 fn normalize_key(key: &str) -> String {
     format!("{}/{}/{}/{}", &key[0..1], &key[1..2], &key[2..3], &key)
 }
 
 /// Get a suitable `Storage` implementation from configuration.
 #[allow(clippy::cognitive_complexity)] // TODO simplify!
-pub fn storage_from_config(config: &Config, pool: &tokio::runtime::Handle) -> Arc<dyn Storage> {
-    for cache_type in config.caches.iter() {
-        match *cache_type {
+pub fn storage_from_config(
+    config: &Config,
+    pool: &tokio::runtime::Handle,
+) -> Result<Arc<dyn Storage>> {
+    if let Some(cache_type) = &config.cache {
+        match cache_type {
+            #[cfg(feature = "azure")]
             CacheType::Azure(config::AzureCacheConfig {
                 ref connection_string,
                 ref container,
                 ref key_prefix,
             }) => {
-                debug!("Trying Azure Blob Store account({})", key_prefix);
-                #[cfg(feature = "azure")]
-                match AzureBlobCache::build(connection_string, container, key_prefix) {
-                    Ok(storage) => {
-                        trace!("Using AzureBlobCache");
-                        return Arc::new(storage);
-                    }
-                    Err(e) => warn!("Failed to create Azure cache: {:?}", e),
-                }
+                debug!("Init azure cache with container {container}, key_prefix {key_prefix}");
+                let storage = AzureBlobCache::build(connection_string, container, key_prefix)
+                    .map_err(|err| anyhow!("create azure cache failed: {err:?}"))?;
+                return Ok(Arc::new(storage));
             }
+            #[cfg(feature = "gcs")]
             CacheType::GCS(config::GCSCacheConfig {
                 ref bucket,
                 ref key_prefix,
@@ -405,99 +466,75 @@ pub fn storage_from_config(config: &Config, pool: &tokio::runtime::Handle) -> Ar
                 ref service_account,
                 ref credential_url,
             }) => {
-                debug!(
-                    "Trying GCS bucket({}, {}, {:?})",
-                    bucket, key_prefix, rw_mode
-                );
-                #[cfg(feature = "gcs")]
-                {
-                    let gcs_read_write_mode = match rw_mode {
-                        config::GCSCacheRWMode::ReadOnly => RWMode::ReadOnly,
-                        config::GCSCacheRWMode::ReadWrite => RWMode::ReadWrite,
-                    };
+                debug!("Init gcs cache with bucket {bucket}, key_prefix {key_prefix}");
 
-                    match GCSCache::build(
-                        bucket,
-                        key_prefix,
-                        cred_path.as_deref(),
-                        service_account.as_deref(),
-                        gcs_read_write_mode,
-                        credential_url.as_deref(),
-                    ) {
-                        Ok(s) => {
-                            trace!("Using GCSCache");
-                            return Arc::new(s);
-                        }
-                        Err(e) => warn!("Failed to create GCS Cache: {:?}", e),
-                    }
-                }
+                let gcs_read_write_mode = match rw_mode {
+                    config::GCSCacheRWMode::ReadOnly => RWMode::ReadOnly,
+                    config::GCSCacheRWMode::ReadWrite => RWMode::ReadWrite,
+                };
+
+                let storage = GCSCache::build(
+                    bucket,
+                    key_prefix,
+                    cred_path.as_deref(),
+                    service_account.as_deref(),
+                    gcs_read_write_mode,
+                    credential_url.as_deref(),
+                )
+                .map_err(|err| anyhow!("create gcs cache failed: {err:?}"))?;
+
+                return Ok(Arc::new(storage));
             }
-            CacheType::GHA(config::GHACacheConfig {
-                ref url,
-                ref token,
-                ref cache_to,
-                ref cache_from,
-            }) => {
-                debug!(
-                    "Trying GHA Cache ({url}, {}***, {cache_to:?}, {cache_from:?})",
-                    &token[..usize::min(3, token.len())]
-                );
-                #[cfg(feature = "gha")]
-                match GHACache::new(url, token, cache_to.clone(), cache_from.clone()) {
-                    Ok(s) => {
-                        trace!("Using GHA Cache: {}", url);
-                        return Arc::new(s);
-                    }
-                    Err(e) => warn!("Failed to create GHA Cache: {:?}", e),
-                }
+            #[cfg(feature = "gha")]
+            CacheType::GHA(config::GHACacheConfig { ref version }) => {
+                debug!("Init gha cache with version {version}");
+
+                let storage = GHACache::build(version)
+                    .map_err(|err| anyhow!("create gha cache failed: {err:?}"))?;
+                return Ok(Arc::new(storage));
             }
+            #[cfg(feature = "memcached")]
             CacheType::Memcached(config::MemcachedCacheConfig { ref url }) => {
-                debug!("Trying Memcached({})", url);
-                #[cfg(feature = "memcached")]
-                match MemcachedCache::new(url, pool) {
-                    Ok(s) => {
-                        trace!("Using Memcached: {}", url);
-                        return Arc::new(s);
-                    }
-                    Err(e) => warn!("Failed to create MemcachedCache: {:?}", e),
-                }
+                debug!("Init memcached cache with url {url}");
+
+                let storage = MemcachedCache::new(url, pool)
+                    .map_err(|err| anyhow!("create memcached cache failed: {err:?}"))?;
+                return Ok(Arc::new(storage));
             }
+            #[cfg(feature = "redis")]
             CacheType::Redis(config::RedisCacheConfig { ref url }) => {
-                debug!("Trying Redis({})", url);
-                #[cfg(feature = "redis")]
-                match RedisCache::new(url) {
-                    Ok(s) => {
-                        trace!("Using Redis: {}", url);
-                        return Arc::new(s);
-                    }
-                    Err(e) => warn!("Failed to create RedisCache: {:?}", e),
-                }
+                debug!("Init redis cache with url {url}");
+                let storage = RedisCache::build(url)
+                    .map_err(|err| anyhow!("create redis cache failed: {err:?}"))?;
+                return Ok(Arc::new(storage));
             }
+            #[cfg(feature = "s3")]
             CacheType::S3(ref c) => {
-                debug!("Trying S3Cache({:?})", c);
-                #[cfg(feature = "s3")]
-                match S3Cache::build(
+                debug!(
+                    "Init s3 cache with bucket {}, endpoint {:?}",
+                    c.bucket, c.endpoint
+                );
+
+                let storage = S3Cache::build(
                     &c.bucket,
                     c.region.as_deref(),
                     &c.key_prefix,
                     c.no_credentials,
                     c.endpoint.as_deref(),
                     c.use_ssl,
-                ) {
-                    Ok(s) => {
-                        trace!("Using S3Cache");
-                        return Arc::new(s);
-                    }
-                    Err(e) => warn!("Failed to create S3Cache: {:?}", e),
-                }
+                )
+                .map_err(|err| anyhow!("create s3 cache failed: {err:?}"))?;
+
+                return Ok(Arc::new(storage));
             }
+            #[allow(unreachable_patterns)]
+            _ => bail!("cache type is not enabled"),
         }
     }
 
-    info!("No configured caches successful, falling back to default");
     let (dir, size) = (&config.fallback_cache.dir, config.fallback_cache.size);
-    trace!("Using DiskCache({:?}, {})", dir, size);
-    Arc::new(DiskCache::new(&dir, size, pool))
+    debug!("Init disk cache with dir {:?}, size {}", dir, size);
+    Ok(Arc::new(DiskCache::new(&dir, size, pool)))
 }
 
 #[cfg(test)]

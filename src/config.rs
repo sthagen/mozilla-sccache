@@ -192,10 +192,9 @@ pub struct GCSCacheConfig {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GHACacheConfig {
-    pub url: String,
-    pub token: String,
-    pub cache_to: Option<String>,
-    pub cache_from: Option<String>,
+    /// Version for gha cache is a namespace. By setting different versions,
+    /// we can avoid mixed caches.
+    pub version: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,9 +243,9 @@ pub struct CacheConfigs {
 }
 
 impl CacheConfigs {
-    /// Return a vec of the available cache types in an arbitrary but
+    /// Return cache type in an arbitrary but
     /// consistent ordering
-    fn into_vec_and_fallback(self) -> (Vec<CacheType>, DiskCacheConfig) {
+    fn into_fallback(self) -> (Option<CacheType>, DiskCacheConfig) {
         let CacheConfigs {
             azure,
             disk,
@@ -257,18 +256,17 @@ impl CacheConfigs {
             s3,
         } = self;
 
-        let caches = s3
+        let cache_type = s3
             .map(CacheType::S3)
-            .into_iter()
-            .chain(redis.map(CacheType::Redis))
-            .chain(memcached.map(CacheType::Memcached))
-            .chain(gcs.map(CacheType::GCS))
-            .chain(gha.map(CacheType::GHA))
-            .chain(azure.map(CacheType::Azure))
-            .collect();
+            .or_else(|| redis.map(CacheType::Redis))
+            .or_else(|| memcached.map(CacheType::Memcached))
+            .or_else(|| gcs.map(CacheType::GCS))
+            .or_else(|| gha.map(CacheType::GHA))
+            .or_else(|| azure.map(CacheType::Azure));
+
         let fallback = disk.unwrap_or_default();
 
-        (caches, fallback)
+        (cache_type, fallback)
     }
 
     /// Override self with any existing fields from other
@@ -574,20 +572,8 @@ fn config_from_env() -> Result<EnvConfig> {
     });
 
     // ======= GHA =======
-    let gha = if let (Some(url), Some(token)) = (
-        env::var("SCCACHE_GHA_CACHE_URL")
-            .ok()
-            .or_else(|| env::var("ACTIONS_CACHE_URL").ok()),
-        env::var("SCCACHE_GHA_RUNTIME_TOKEN")
-            .ok()
-            .or_else(|| env::var("ACTIONS_RUNTIME_TOKEN").ok()),
-    ) {
-        Some(GHACacheConfig {
-            url,
-            token,
-            cache_to: env::var("SCCACHE_GHA_CACHE_TO").ok(),
-            cache_from: env::var("SCCACHE_GHA_CACHE_FROM").ok(),
-        })
+    let gha = if let Ok(version) = env::var("SCCACHE_GHA_VERSION") {
+        Some(GHACacheConfig { version })
     } else {
         None
     };
@@ -666,7 +652,7 @@ fn config_file(env_var: &str, leaf: &str) -> PathBuf {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
-    pub caches: Vec<CacheType>,
+    pub cache: Option<CacheType>,
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
     pub server_startup_timeout: Option<std::time::Duration>,
@@ -700,9 +686,9 @@ impl Config {
         let EnvConfig { cache } = env_conf;
         conf_caches.merge(cache);
 
-        let (caches, fallback_cache) = conf_caches.into_vec_and_fallback();
+        let (caches, fallback_cache) = conf_caches.into_fallback();
         Self {
-            caches,
+            cache: caches,
             fallback_cache,
             dist,
             server_startup_timeout,
@@ -990,19 +976,9 @@ fn config_overrides() {
     assert_eq!(
         Config::from_env_and_file_configs(env_conf, file_conf),
         Config {
-            caches: vec![
-                CacheType::Redis(RedisCacheConfig {
-                    url: "myotherredisurl".to_owned()
-                }),
-                CacheType::Memcached(MemcachedCacheConfig {
-                    url: "memurl".to_owned()
-                }),
-                CacheType::Azure(AzureCacheConfig {
-                    connection_string: String::new(),
-                    container: String::new(),
-                    key_prefix: String::new()
-                }),
-            ],
+            cache: Some(CacheType::Redis(RedisCacheConfig {
+                url: "myotherredisurl".to_owned()
+            }),),
             fallback_cache: DiskCacheConfig {
                 dir: "/env-cache".into(),
                 size: 5,
@@ -1094,10 +1070,7 @@ key_prefix = "prefix"
 service_account = "example_service_account"
 
 [cache.gha]
-url = "http://localhost"
-token = "secret"
-cache_to = "sccache-latest"
-cache_from = "sccache-"
+version = "sccache"
 
 [cache.memcached]
 url = "..."
@@ -1133,10 +1106,7 @@ no_credentials = true
                     credential_url: None,
                 }),
                 gha: Some(GHACacheConfig {
-                    url: "http://localhost".to_owned(),
-                    token: "secret".to_owned(),
-                    cache_to: Some("sccache-latest".to_owned()),
-                    cache_from: Some("sccache-".to_owned()),
+                    version: "sccache".to_string()
                 }),
                 redis: Some(RedisCacheConfig {
                     url: "redis://user:passwd@1.2.3.4:6379/1".to_owned(),
