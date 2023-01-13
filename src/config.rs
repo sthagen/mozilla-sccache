@@ -192,6 +192,7 @@ pub struct GCSCacheConfig {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GHACacheConfig {
+    pub enabled: bool,
     /// Version for gha cache is a namespace. By setting different versions,
     /// we can avoid mixed caches.
     pub version: String,
@@ -537,8 +538,8 @@ fn config_from_env() -> Result<EnvConfig> {
 
 
         if env::var("SCCACHE_GCS_OAUTH_URL").is_ok() {
-            warn!("SCCACHE_GCS_OAUTH_URL has been deprecated");
-            warn!("if you intend to use vm metadata for auth, please set correct service account intead");
+            eprintln!("SCCACHE_GCS_OAUTH_URL has been deprecated");
+            eprintln!("if you intend to use vm metadata for auth, please set correct service account intead");
         }
 
         let credential_url = env::var("SCCACHE_GCS_CREDENTIALS_URL").ok();
@@ -573,7 +574,23 @@ fn config_from_env() -> Result<EnvConfig> {
 
     // ======= GHA =======
     let gha = if let Ok(version) = env::var("SCCACHE_GHA_VERSION") {
-        Some(GHACacheConfig { version })
+        // If SCCACHE_GHA_VERSION has been set, we don't need to check
+        // SCCACHE_GHA_ENABLED's value anymore.
+        Some(GHACacheConfig {
+            enabled: true,
+            version,
+        })
+    } else if let Ok(enabled) = env::var("SCCACHE_GHA_ENABLED") {
+        // If only SCCACHE_GHA_ENABLED has been set, enable with
+        // default version.
+        if enabled == "on" || enabled == "true" {
+            Some(GHACacheConfig {
+                enabled: true,
+                version: "".to_string(),
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1070,6 +1087,7 @@ key_prefix = "prefix"
 service_account = "example_service_account"
 
 [cache.gha]
+enabled = true
 version = "sccache"
 
 [cache.memcached]
@@ -1106,6 +1124,7 @@ no_credentials = true
                     credential_url: None,
                 }),
                 gha: Some(GHACacheConfig {
+                    enabled: true,
                     version: "sccache".to_string()
                 }),
                 redis: Some(RedisCacheConfig {

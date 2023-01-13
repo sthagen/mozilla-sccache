@@ -392,18 +392,34 @@ impl Storage for opendal::Operator {
 
         let path = ".sccache_check";
 
-        let can_write = match self.object(path).write("Hello, World!").await {
-            Ok(_) => true,
-            Err(err) if err.kind() == ErrorKind::ObjectAlreadyExists => true,
-            Err(err) if err.kind() == ErrorKind::ObjectPermissionDenied => false,
-            Err(err) => bail!("cache storage failed to write: {:?}", err),
-        };
-
+        // Read is required, return error directly if we can't read .
         match self.object(path).read().await {
             Ok(_) => (),
             // Read not exist file with not found is ok.
             Err(err) if err.kind() == ErrorKind::ObjectNotFound => (),
+            // Tricky Part.
+            //
+            // We tolerate rate limited here to make sccache keep running.
+            // For the worse case, we will miss all the cache.
+            //
+            // In some super rare cases, user could configure storage in wrong
+            // and hitting other services rate limit. There are few things we
+            // can do, so we will print our the error here to make users know
+            // about it.
+            Err(err) if err.kind() == ErrorKind::ObjectRateLimited => {
+                eprintln!("cache storage read check: {err:?}, but we decide to keep running")
+            }
             Err(err) => bail!("cache storage failed to read: {:?}", err),
+        };
+
+        let can_write = match self.object(path).write("Hello, World!").await {
+            Ok(_) => true,
+            Err(err) if err.kind() == ErrorKind::ObjectAlreadyExists => true,
+            // Toralte all other write errors because we can do read as least.
+            Err(err) => {
+                eprintln!("storage write check failed: {err:?}");
+                false
+            }
         };
 
         if can_write {
@@ -486,7 +502,7 @@ pub fn storage_from_config(
                 return Ok(Arc::new(storage));
             }
             #[cfg(feature = "gha")]
-            CacheType::GHA(config::GHACacheConfig { ref version }) => {
+            CacheType::GHA(config::GHACacheConfig { ref version, .. }) => {
                 debug!("Init gha cache with version {version}");
 
                 let storage = GHACache::build(version)

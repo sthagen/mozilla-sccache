@@ -30,7 +30,7 @@
 # This script can be run from a github action. When run locally, make
 # sure to install the required packages:
 #
-#     pkg install -y curl gmake gtar pot sudo
+#     pkg install -y ca-root-nss curl gmake gtar pot sudo
 #
 
 # shellcheck disable=SC3040
@@ -42,6 +42,7 @@ init()
 	OS_VERSION="$(freebsd-version | awk -F- '{print $1}')"
 	PUB_INTF="$(netstat -4rn | grep default | awk '{ print $4}')"
 	TEST_TMPDIR=$(mktemp -d "/tmp/sccache_freebsd.XXXXXXX") || exit 1
+	chmod g+r "$TEST_TMPDIR"
 	export XDG_CONFIG_HOME="$TEST_TMPDIR/.config"
 	mkdir -p "$XDG_CONFIG_HOME"
 	export SCCACHE_DIR="$TEST_TMPDIR/.cache"
@@ -62,7 +63,8 @@ output_env_info()
 	cargo -V
 	rustc -V
 	curl --version
-	pot version
+	# See https://github.com/bsdpot/pot/pull/253
+	pot version || true
 	gtar --version
 	echo "## installed packages"
 	pkg info
@@ -169,7 +171,9 @@ prepare_pot()
 	sudo sysrc -f /usr/local/etc/pot/pot.conf POT_TMP="$TEST_TMPDIR"
 	sudo sysrc -f /usr/local/etc/pot/pot.conf \
 	  POT_FS_ROOT="$TEST_TMPDIR/pot"
+	sudo sysrc -f /usr/local/etc/pot/pot.conf POT_GROUP=wheel
 	sudo pot init -f ""
+	sudo pot version
 	sudo cp "$HOME"/.potcache/*.txz /var/cache/pot 2>/dev/null || true
 	sudo pot create -p sccache-template -N alias -i "lo0|127.0.0.2" \
 	  -t single -b "$OS_VERSION"
@@ -311,9 +315,19 @@ cleanup()
 	set -e
 }
 
+install_signal_handler()
+{
+	trap 'remove_signal_handler; cleanup; exit' EXIT INT HUP
+}
+
+remove_signal_handler()
+{
+	trap - EXIT INT HUP
+}
+
 main()
 {
-	trap 'cleanup; trap - EXIT; exit' EXIT INT HUP
+	install_signal_handler
 	init
 	output_env_info
 	build_and_test_project
@@ -326,8 +340,8 @@ main()
 	start_sccache_server
 	test_sccache_dist_01
 	test_sccache_dist_02
+	remove_signal_handler
 	cleanup
-	trap - EXIT INT HUP
 }
 
 # run main function
