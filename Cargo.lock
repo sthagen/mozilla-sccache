@@ -1565,7 +1565,7 @@ dependencies = [
  "pin-project",
  "quick-xml",
  "redis",
- "reqsign",
+ "reqsign 0.7.6",
  "reqwest",
  "serde",
  "serde_json",
@@ -1973,13 +1973,42 @@ dependencies = [
 
 [[package]]
 name = "reqsign"
-version = "0.7.4"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c97ac0f771c78ddf4bcb73c8454c76565a7249780e7296767f7e89661b0e045"
+checksum = "642e28b7bf97b5112610ee78c7128f67d8e73fb17c88ce6f5f67dc9816957d52"
 dependencies = [
  "anyhow",
  "backon",
  "base64 0.20.0",
+ "bytes",
+ "dirs",
+ "form_urlencoded",
+ "hex",
+ "hmac",
+ "http",
+ "jsonwebtoken",
+ "log",
+ "once_cell",
+ "percent-encoding",
+ "quick-xml",
+ "rust-ini",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "time 0.3.17",
+ "ureq",
+]
+
+[[package]]
+name = "reqsign"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f446438814fde3785305a59a85a6d1b361ce2c9d29e58dd87c9103a242c40b6"
+dependencies = [
+ "anyhow",
+ "backon",
+ "base64 0.21.0",
  "bytes",
  "dirs",
  "form_urlencoded",
@@ -2236,7 +2265,7 @@ dependencies = [
  "predicates",
  "rand 0.8.5",
  "regex",
- "reqsign",
+ "reqsign 0.8.1",
  "reqwest",
  "retry",
  "rouille",
