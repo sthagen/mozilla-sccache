@@ -1,9 +1,9 @@
+use fs_err as fs;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 use sccache::config::HTTPUrl;
 use sccache::dist::{self, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 use std::env;
-use std::fs;
 use std::io::Write;
 use std::net::{self, IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -46,14 +46,15 @@ pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     let _ = sccache_command()
         .arg("--start-server")
         // Uncomment following lines to debug locally.
-        // .env("SCCACHE_LOG", "debug")
-        // .env("SCCACHE_ERROR_LOG", "/tmp/sccache_log.txt")
+        .env("SCCACHE_LOG", "debug")
+        .env("SCCACHE_ERROR_LOG", "/tmp/sccache_local_daemon.txt")
         .env("SCCACHE_CONF", cfg_path)
         .env("SCCACHE_CACHED_CONF", cached_cfg_path)
         .status()
         .unwrap()
         .success();
 }
+
 pub fn stop_local_daemon() {
     trace!("sccache --stop-server");
     drop(
@@ -264,7 +265,7 @@ impl DistSystem {
                 "-e",
                 "SCCACHE_NO_DAEMON=1",
                 "-e",
-                "SCCACHE_LOG=sccache=trace",
+                "SCCACHE_LOG=debug",
                 "-e",
                 "RUST_BACKTRACE=1",
                 "--network",
@@ -332,7 +333,7 @@ impl DistSystem {
                 "--name",
                 &server_name,
                 "-e",
-                "SCCACHE_LOG=sccache=trace",
+                "SCCACHE_LOG=debug",
                 "-e",
                 "RUST_BACKTRACE=1",
                 "--network",
