@@ -27,13 +27,13 @@ anyhow = "1.0"
 ar = "0.9"
 async-trait = "0.1"
 atty = "0.2.6"
-base64 = "0.20"
+base64 = "0.21"
 bincode = "1"
 blake3 = "1"
 byteorder = "1.0"
 bytes = "1"
-opendal = { version= "0.27.0", optional=true }
-reqsign = {version="0.8.1", optional=true}
+opendal = { version= "0.27.1", optional=true }
+reqsign = {version="0.8.3", optional=true}
 clap = { version = "4.0.32", features = ["derive", "env", "wrap_help"] }
 directories = "4.0.1"
 env_logger = "0.10"
@@ -41,7 +41,7 @@ filetime = "0.2"
 flate2 = { version = "1.0", optional = true, default-features = false, features = ["rust_backend"] }
 fs-err = "2.9"
 futures = "0.3"
-gzp = { version = "0.11.1", default-features = false, features = ["deflate_rust"]  }
+gzp = { version = "0.11.3", default-features = false, features = ["deflate_rust"]  }
 http = "0.2"
 hyper = { version = "0.14.24", optional = true, features = ["server"] }
 jobserver = "0.1"
@@ -70,7 +70,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "io-util", "time", "net"
 tokio-serde = "0.8"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = "0.4"
-toml = "0.5"
+toml = "0.7"
 url = { version = "2", optional = true }
 uuid = { version = "1.2", features = ["v4"] }
 walkdir = "2"
