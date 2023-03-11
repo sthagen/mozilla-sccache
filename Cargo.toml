@@ -1,6 +1,6 @@
 [package]
 name = "sccache"
-version = "0.4.0-pre.8"
+version = "0.4.0-pre.10"
 license = "Apache-2.0"
 description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible, storing a cache in a remote storage using the S3 API."
 repository = "https://github.com/mozilla/sccache/"
@@ -36,6 +36,7 @@ opendal = { version= "0.27.1", optional=true }
 reqsign = {version="0.8.3", optional=true}
 clap = { version = "4.0.32", features = ["derive", "env", "wrap_help"] }
 directories = "4.0.1"
+encoding = "0.2"
 env_logger = "0.10"
 filetime = "0.2"
 flate2 = { version = "1.0", optional = true, default-features = false, features = ["rust_backend"] }
@@ -72,7 +73,7 @@ tokio-util = { version = "0.7", features = ["codec", "io"] }
 tower = "0.4"
 toml = "0.7"
 url = { version = "2", optional = true }
-uuid = { version = "1.2", features = ["v4"] }
+uuid = { version = "1.3", features = ["v4"] }
 walkdir = "2"
 # by default which pulls in an outdated failure version
 which = { version = "4", default-features = false }
@@ -98,7 +99,7 @@ once_cell = "1.17"
 serial_test = "1.0"
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.4"
+daemonize = "0.5"
 
 [target.'cfg(not(target_os = "freebsd"))'.dependencies.libmount]
 optional = true
@@ -127,6 +128,10 @@ webdav = ["opendal"]
 memcached = ["opendal/services-memcached"]
 native-zlib = []
 redis = ["url", "opendal/services-redis"]
+# Enable features that will build a vendored version of openssl and
+# statically linked with it, instead of linking against the system-wide openssl
+# dynamically or statically.
+vendored-openssl = ["openssl?/vendored"]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
 # Enables distributed support in the sccache client
