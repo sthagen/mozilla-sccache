@@ -2,7 +2,7 @@
 edition = "2021"
 name = "sccache"
 rust-version = "1.65"
-version = "0.5.3"
+version = "0.5.4"
 
 categories = ["command-line-utilities", "development-tools::build-utils"]
 description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible, storing a cache in a remote storage using various cloud storage."
@@ -47,7 +47,7 @@ gzp = { version = "0.11.3", default-features = false, features = [
 ] }
 http = "0.2"
 hyper = { version = "0.14.25", optional = true, features = ["server"] }
-is-terminal = "0.4.5"
+is-terminal = "0.4.7"
 jobserver = "0.1"
 jwt = { package = "jsonwebtoken", version = "8", optional = true }
 libc = "0.2.140"
@@ -116,9 +116,9 @@ version-compare = { version = "0.1.1", optional = true }
 [dev-dependencies]
 assert_cmd = "2.0.10"
 cc = "1.0"
-chrono = "0.4.24"
+chrono = "0.4.26"
 itertools = "0.10"
-predicates = "=3.0.2"
+predicates = "=3.0.3"
 serial_test = "2.0"
 temp-env = "0.3.4"
 thirtyfour_sync = "0.27"
