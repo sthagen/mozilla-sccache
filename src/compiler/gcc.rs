@@ -67,10 +67,16 @@ impl CCompilerImpl for Gcc {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
+        preprocessor_cache_mode: bool,
     ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let ignorable_whitespace_flags = if preprocessor_cache_mode {
+            vec![]
+        } else {
+            vec!["-P".to_string()]
+        };
         preprocess(
             creator,
             executable,
@@ -80,7 +86,7 @@ impl CCompilerImpl for Gcc {
             may_dist,
             self.kind(),
             rewrite_includes_only,
-            vec!["-P".to_string()],
+            ignorable_whitespace_flags,
         )
         .await
     }
@@ -176,6 +182,7 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-U", OsString, CanBeSeparated, PassThrough),
     take_arg!("-V", OsString, Separated, PassThrough),
     flag!("-Werror=pedantic", PedanticFlag),
+    take_arg!("-Wp", OsString, Concatenated(','), PreprocessorArgument),
     flag!("-Wpedantic", PedanticFlag),
     take_arg!("-Xassembler", OsString, Separated, PassThrough),
     take_arg!("-Xlinker", OsString, Separated, PassThrough),
@@ -280,6 +287,8 @@ where
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
     let it = ExpandIncludeFile::new(cwd, arguments);
+
+    let mut too_hard_for_preprocessor_cache_mode = false;
 
     for arg in ArgsIter::new(it, arg_info) {
         let arg = try_or_cannot_cache!(arg, "argument parse");
@@ -414,9 +423,16 @@ where
                 extra_hash_files.push(cwd.join(path));
                 &mut common_args
             }
-            Some(PreprocessorArgumentFlag)
-            | Some(PreprocessorArgument(_))
-            | Some(PreprocessorArgumentPath(_)) => &mut preprocessor_args,
+            Some(PreprocessorArgument(_)) => {
+                too_hard_for_preprocessor_cache_mode = match arg.flag_str() {
+                    Some(s) => s == "-Xpreprocessor" || s == "-Wp",
+                    _ => false,
+                };
+                &mut preprocessor_args
+            }
+            Some(PreprocessorArgumentFlag) | Some(PreprocessorArgumentPath(_)) => {
+                &mut preprocessor_args
+            }
             Some(DepArgumentPath(_)) | Some(NeedDepTarget) => &mut dependency_args,
             Some(DoCompilation) | Some(Language(_)) | Some(Output(_)) | Some(XClang(_))
             | Some(DepTarget(_)) => continue,
@@ -603,6 +619,7 @@ where
         profile_generate,
         color_mode,
         suppress_rewrite_includes_only,
+        too_hard_for_preprocessor_cache_mode,
     })
 }
 
@@ -1893,6 +1910,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: false,
         };
         let compiler = &f.bins[0];
         // Compiler invocation.
@@ -2022,5 +2040,29 @@ mod test {
             vec![],
         );
         assert!(!cmd.args.contains(&"-x".into()));
+    }
+
+    #[test]
+    fn test_too_hard_for_preprocessor_cache_mode() {
+        let args = stringvec!["-c", "foo.c", "-o", "foo.o"];
+        let parsed_args = match parse_arguments_(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!parsed_args.too_hard_for_preprocessor_cache_mode);
+
+        let args = stringvec!["-c", "foo.c", "-o", "foo.o", "-Xpreprocessor", "-M"];
+        let parsed_args = match parse_arguments_(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(parsed_args.too_hard_for_preprocessor_cache_mode);
+
+        let args = stringvec!["-c", "foo.c", "-o", "foo.o", r#"-Wp,-DFOO="something""#];
+        let parsed_args = match parse_arguments_(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(parsed_args.too_hard_for_preprocessor_cache_mode);
     }
 }

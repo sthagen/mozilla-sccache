@@ -33,7 +33,7 @@ use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::Mutex;
 
-use crate::errors::*;
+use crate::{cache::PreprocessorCacheModeConfig, errors::*};
 
 static CACHED_CONFIG_PATH: Lazy<PathBuf> = Lazy::new(CachedConfig::file_config_path);
 static CACHED_CONFIG: Lazy<Mutex<Option<CachedFileConfig>>> = Lazy::new(|| Mutex::new(None));
@@ -160,6 +160,7 @@ pub struct DiskCacheConfig {
     pub dir: PathBuf,
     // TODO: use deserialize_with to allow human-readable sizes in toml
     pub size: u64,
+    pub preprocessor_cache_mode: PreprocessorCacheModeConfig,
 }
 
 impl Default for DiskCacheConfig {
@@ -167,6 +168,7 @@ impl Default for DiskCacheConfig {
         DiskCacheConfig {
             dir: default_disk_cache_dir(),
             size: default_disk_cache_size(),
+            preprocessor_cache_mode: Default::default(),
         }
     }
 }
@@ -707,10 +709,18 @@ fn config_from_env() -> Result<EnvConfig> {
         .ok()
         .and_then(|v| parse_size(&v));
 
+    let mut preprocessor_mode_config = PreprocessorCacheModeConfig::default();
+    match env::var("SCCACHE_DIRECT").as_deref() {
+        Ok("on") | Ok("true") => preprocessor_mode_config.use_preprocessor_cache_mode = true,
+        Ok("off") | Ok("false") => preprocessor_mode_config.use_preprocessor_cache_mode = false,
+        _ => {}
+    };
+
     let disk = if disk_dir.is_some() || disk_sz.is_some() {
         Some(DiskCacheConfig {
             dir: disk_dir.unwrap_or_else(default_disk_cache_dir),
             size: disk_sz.unwrap_or_else(default_disk_cache_size),
+            preprocessor_cache_mode: preprocessor_mode_config,
         })
     } else {
         None
@@ -1053,6 +1063,7 @@ fn config_overrides() {
             disk: Some(DiskCacheConfig {
                 dir: "/env-cache".into(),
                 size: 5,
+                preprocessor_cache_mode: Default::default(),
             }),
             redis: Some(RedisCacheConfig {
                 url: "myotherredisurl".to_owned(),
@@ -1066,6 +1077,7 @@ fn config_overrides() {
             disk: Some(DiskCacheConfig {
                 dir: "/file-cache".into(),
                 size: 15,
+                preprocessor_cache_mode: Default::default(),
             }),
             memcached: Some(MemcachedCacheConfig {
                 url: "memurl".to_owned(),
@@ -1089,6 +1101,7 @@ fn config_overrides() {
             fallback_cache: DiskCacheConfig {
                 dir: "/env-cache".into(),
                 size: 5,
+                preprocessor_cache_mode: Default::default(),
             },
             dist: Default::default(),
             server_startup_timeout: None,
@@ -1275,6 +1288,7 @@ token = "webdavtoken"
                 disk: Some(DiskCacheConfig {
                     dir: PathBuf::from("/tmp/.cache/sccache"),
                     size: 7 * 1024 * 1024 * 1024,
+                    preprocessor_cache_mode: Default::default(),
                 }),
                 gcs: Some(GCSCacheConfig {
                     bucket: "bucket".to_owned(),

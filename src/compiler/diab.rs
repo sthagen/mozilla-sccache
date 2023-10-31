@@ -67,6 +67,7 @@ impl CCompilerImpl for Diab {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         _rewrite_includes_only: bool,
+        _preprocessor_cache_mode: bool,
     ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
@@ -299,6 +300,7 @@ where
         // FIXME: Implement me.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
+        too_hard_for_preprocessor_cache_mode: false,
     })
 }
 
@@ -764,6 +766,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: false,
         };
         let compiler = &f.bins[0];
         // Compiler invocation.
