@@ -2,7 +2,7 @@
 edition = "2021"
 name = "sccache"
 rust-version = "1.67.1"
-version = "0.7.0"
+version = "0.7.1"
 
 categories = ["command-line-utilities", "development-tools::build-utils"]
 description = "Sccache is a ccache-like tool. It is used as a compiler wrapper and avoids compilation when possible, storing a cache in a remote storage using various cloud storage."
@@ -30,11 +30,11 @@ async-trait = "0.1"
 base64 = "0.21"
 bincode = "1"
 blake3 = "1"
-byteorder = "1.0"
+byteorder = "1.5"
 bytes = "1"
 chrono = "0.4"
 clap = { version = "4.1.11", features = ["derive", "env", "wrap_help"] }
-directories = "5.0.0"
+directories = "5.0.1"
 encoding = "0.2"
 env_logger = "0.10"
 filetime = "0.2"
@@ -47,7 +47,7 @@ gzp = { version = "0.11.3", default-features = false, features = [
   "deflate_rust",
 ] }
 http = "0.2"
-hyper = { version = "0.14.25", optional = true, features = ["server"] }
+hyper = { version = "0.14.27", optional = true, features = ["server"] }
 is-terminal = "0.4.7"
 jobserver = "0.1"
 jwt = { package = "jsonwebtoken", version = "8", optional = true }
@@ -90,7 +90,7 @@ tokio = { version = "1", features = [
 ] }
 tokio-serde = "0.8"
 tokio-util = { version = "0.7", features = ["codec", "io"] }
-toml = "0.7"
+toml = "0.8"
 tower = "0.4"
 trust-dns-resolver = { version = "0.22.0", features = [
   "dnssec-ring",
@@ -116,7 +116,7 @@ syslog = { version = "6", optional = true }
 version-compare = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
-assert_cmd = "2.0.11"
+assert_cmd = "2.0.12"
 cc = "1.0"
 chrono = "0.4.26"
 itertools = "0.10"
