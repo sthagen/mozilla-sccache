@@ -103,7 +103,7 @@ walkdir = "2"
 # by default which pulls in an outdated failure version
 which = { version = "4", default-features = false }
 zip = { version = "0.6", default-features = false }
-zstd = "0.12"
+zstd = "0.13"
 
 # dist-server only
 memmap2 = "0.9.0"
@@ -119,10 +119,12 @@ version-compare = { version = "0.1.1", optional = true }
 assert_cmd = "2.0.12"
 cc = "1.0"
 chrono = "0.4.26"
+filetime = "0.2"
 itertools = "0.10"
 predicates = "=3.0.3"
 serial_test = "2.0"
 temp-env = "0.3.4"
+test-case = "3.2.1"
 thirtyfour_sync = "0.27"
 
 [target.'cfg(unix)'.dependencies]
