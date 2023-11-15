@@ -885,9 +885,6 @@ where
         .args(&parsed_args.preprocessor_args)
         .args(&parsed_args.dependency_args)
         .args(&parsed_args.common_args)
-        // Windows SDK generates C4668 during preprocessing, but compiles fine.
-        // Read for more info: https://github.com/mozilla/sccache/issues/1725
-        .arg("/wd4668")
         .env_clear()
         .envs(env_vars.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd);
@@ -902,6 +899,9 @@ where
             cmd.arg("/sourceDependencies");
             cmd.arg(depfile);
         }
+        // Windows SDK generates C4668 during preprocessing, but compiles fine.
+        // Read for more info: https://github.com/mozilla/sccache/issues/1725
+        cmd.arg("/wd4668");
     }
 
     if rewrite_includes_only && is_clang {
@@ -1131,7 +1131,7 @@ impl<'a> Iterator for ExpandIncludeFile<'a> {
         loop {
             // Visit all arguments found in the most recently read response file.
             // Since response files are not recursive, we do not need to worry
-            // about these containing addditional @ directives.
+            // about these containing additional @ directives.
             if let Some(response_file_arg) = self.stack.pop() {
                 return Some(response_file_arg);
             }
@@ -1151,7 +1151,7 @@ impl<'a> Iterator for ExpandIncludeFile<'a> {
                 Ok(content) => content,
                 Err(err) => {
                     debug!("failed to read @-file `{}`: {}", file_path.display(), err);
-                    // If we failed to read the file content, return the orginal arg (including the `@` directive).
+                    // If we failed to read the file content, return the original arg (including the `@` directive).
                     return Some(arg);
                 }
             };
