@@ -35,6 +35,18 @@ jobs:
       - name: Check
         run: cargo ${{ matrix.cargo_cmd }}
 
+  check_features:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature: [azure, gcs, gha, memcached, redis, s3, webdav]
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Check feature ${{ matrix.feature }}
+        run: cargo check --no-default-features --features ${{ matrix.feature }}
+
   toml_format:
     runs-on: ubuntu-latest
     steps:
@@ -110,6 +122,7 @@ jobs:
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    container: ${{ fromJson(matrix.container || '{"image":null}') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -123,6 +136,12 @@ jobs:
             target: x86_64-unknown-linux-musl
           - os: ubuntu-20.04
             target: aarch64-unknown-linux-musl
+          - os: ubuntu-20.04
+            target: armv7-unknown-linux-musleabi
+            container: '{"image": "messense/rust-musl-cross:armv7-musleabi"}'
+          - os: ubuntu-20.04
+            target: i686-unknown-linux-musl
+            container: '{"image": "messense/rust-musl-cross:i686-musl"}'
           - os: macOS-11
             target: x86_64-apple-darwin
             macosx_deployment_target: 10.13
@@ -145,6 +164,7 @@ jobs:
         with:
           toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || 'stable' }}
           target: ${{ matrix.target }}
+        if: ${{ !matrix.container }}
 
       - name: Install musl-tools (x86_64)
         run: sudo apt-get install musl-tools
@@ -181,7 +201,7 @@ jobs:
           ID: ${{ startsWith(github.ref, 'refs/tags/') && github.ref || github.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.binary || 'sccache' }}-${{ steps.id.outputs.id }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary || 'sccache' }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
@@ -338,7 +358,7 @@ jobs:
           fi
 
       - name: Get artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
 
       - name: Create release assets
         run: |
