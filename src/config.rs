@@ -567,6 +567,28 @@ pub struct EnvConfig {
     cache: CacheConfigs,
 }
 
+fn key_prefix_from_env_var(env_var_name: &str) -> String {
+    env::var(env_var_name)
+        .ok()
+        .as_ref()
+        .map(|s| s.trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn number_from_env_var<A: std::str::FromStr>(env_var_name: &str) -> Option<Result<A>>
+where
+    <A as FromStr>::Err: std::fmt::Debug,
+{
+    let value = env::var(env_var_name).ok()?;
+
+    value
+        .parse::<A>()
+        .map_err(|err| anyhow!("{env_var_name} value is invalid: {err:?}"))
+        .into()
+}
+
 fn config_from_env() -> Result<EnvConfig> {
     // ======= AWS =======
     let s3 = if let Ok(bucket) = env::var("SCCACHE_BUCKET") {
@@ -591,13 +613,7 @@ fn config_from_env() -> Result<EnvConfig> {
                     ),
                 })?;
         let endpoint = env::var("SCCACHE_ENDPOINT").ok();
-        let key_prefix = env::var("SCCACHE_S3_KEY_PREFIX")
-            .ok()
-            .as_ref()
-            .map(|s| s.trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned() + "/")
-            .unwrap_or_default();
+        let key_prefix = key_prefix_from_env_var("SCCACHE_S3_KEY_PREFIX");
 
         Some(S3CacheConfig {
             bucket,
@@ -620,33 +636,45 @@ fn config_from_env() -> Result<EnvConfig> {
     }
 
     // ======= redis =======
-    let ttl = match env::var("SCCACHE_REDIS_TTL") {
-        Ok(v) => v
-            .parse()
-            .map_err(|err| anyhow!("SCCACHE_REDIS_TTL value is invalid: {err:?}"))?,
-        Err(_) => DEFAULT_REDIS_CACHE_TTL,
+    let redis = if let Ok(url) = env::var("SCCACHE_REDIS") {
+        let ttl = number_from_env_var("SCCACHE_REDIS_EXPIRATION")
+            .or_else(|| number_from_env_var("SCCACHE_REDIS_TTL"))
+            .transpose()?
+            .unwrap_or(DEFAULT_REDIS_CACHE_TTL);
+
+        let key_prefix = key_prefix_from_env_var("SCCACHE_REDIS_KEY_PREFIX");
+
+        Some(RedisCacheConfig {
+            url,
+            ttl,
+            key_prefix,
+        })
+    } else {
+        None
     };
-    let redis = env::var("SCCACHE_REDIS").ok().map(|url| RedisCacheConfig {
-        url,
-        ttl,
-        key_prefix: String::new(),
-    });
+
+    if env::var_os("SCCACHE_REDIS_EXPIRATION").is_some()
+        && env::var_os("SCCACHE_REDIS_TTL").is_some()
+    {
+        bail!("You mustn't set both SCCACHE_REDIS_EXPIRATION and SCCACHE_REDIS_TTL. Use only one.");
+    }
 
     // ======= memcached =======
-    let expiration = match env::var("SCCACHE_MEMCACHED_EXPIRATION").ok() {
-        None => DEFAULT_MEMCACHED_CACHE_EXPIRATION,
-        Some(v) => v
-            .parse()
-            .map_err(|err| anyhow!("SCCACHE_MEMCACHED_EXPIRATION value is invalid: {err:?}"))?,
-    };
+    let memcached = if let Ok(url) = env::var("SCCACHE_MEMCACHED") {
+        let expiration = number_from_env_var("SCCACHE_MEMCACHED_EXPIRATION")
+            .transpose()?
+            .unwrap_or(DEFAULT_MEMCACHED_CACHE_EXPIRATION);
 
-    let memcached = env::var("SCCACHE_MEMCACHED")
-        .ok()
-        .map(|url| MemcachedCacheConfig {
+        let key_prefix = key_prefix_from_env_var("SCCACHE_MEMCACHED_KEY_PREFIX");
+
+        Some(MemcachedCacheConfig {
             url,
             expiration,
-            key_prefix: String::new(),
-        });
+            key_prefix,
+        })
+    } else {
+        None
+    };
 
     // ======= GCP/GCS =======
     if (env::var("SCCACHE_GCS_CREDENTIALS_URL").is_ok()
@@ -660,15 +688,7 @@ fn config_from_env() -> Result<EnvConfig> {
     }
 
     let gcs = env::var("SCCACHE_GCS_BUCKET").ok().map(|bucket| {
-        let key_prefix = env::var("SCCACHE_GCS_KEY_PREFIX")
-            .ok()
-            .as_ref()
-            .map(|s| s.trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default()
-            .to_owned();
-
-
+        let key_prefix = key_prefix_from_env_var("SCCACHE_GCS_KEY_PREFIX");
 
         if env::var("SCCACHE_GCS_OAUTH_URL").is_ok() {
             eprintln!("SCCACHE_GCS_OAUTH_URL has been deprecated");
@@ -733,13 +753,7 @@ fn config_from_env() -> Result<EnvConfig> {
         env::var("SCCACHE_AZURE_CONNECTION_STRING"),
         env::var("SCCACHE_AZURE_BLOB_CONTAINER"),
     ) {
-        let key_prefix = env::var("SCCACHE_AZURE_KEY_PREFIX")
-            .ok()
-            .as_ref()
-            .map(|s| s.trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default()
-            .to_owned();
+        let key_prefix = key_prefix_from_env_var("SCCACHE_AZURE_KEY_PREFIX");
         Some(AzureCacheConfig {
             connection_string,
             container,
@@ -751,13 +765,7 @@ fn config_from_env() -> Result<EnvConfig> {
 
     // ======= WebDAV =======
     let webdav = if let Ok(endpoint) = env::var("SCCACHE_WEBDAV_ENDPOINT") {
-        let key_prefix = env::var("SCCACHE_WEBDAV_KEY_PREFIX")
-            .ok()
-            .as_ref()
-            .map(|s| s.trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default()
-            .to_owned();
+        let key_prefix = key_prefix_from_env_var("SCCACHE_WEBDAV_KEY_PREFIX");
         let username = env::var("SCCACHE_WEBDAV_USERNAME").ok();
         let password = env::var("SCCACHE_WEBDAV_PASSWORD").ok();
         let token = env::var("SCCACHE_WEBDAV_TOKEN").ok();
@@ -776,13 +784,7 @@ fn config_from_env() -> Result<EnvConfig> {
     // ======= OSS =======
     let oss = if let Ok(bucket) = env::var("SCCACHE_OSS_BUCKET") {
         let endpoint = env::var("SCCACHE_OSS_ENDPOINT").ok();
-        let key_prefix = env::var("SCCACHE_OSS_KEY_PREFIX")
-            .ok()
-            .as_ref()
-            .map(|s| s.trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_default()
-            .to_owned();
+        let key_prefix = key_prefix_from_env_var("SCCACHE_OSS_KEY_PREFIX");
 
         let no_credentials =
             env::var("SCCACHE_OSS_NO_CREDENTIALS").map_or(Ok(false), |val| match val.as_str() {
@@ -1202,7 +1204,7 @@ fn config_overrides() {
             redis: Some(RedisCacheConfig {
                 url: "myotherredisurl".to_owned(),
                 ttl: 24 * 3600,
-                key_prefix: String::new(),
+                key_prefix: "/redis/prefix".into(),
             }),
             ..Default::default()
         },
@@ -1223,7 +1225,7 @@ fn config_overrides() {
             }),
             redis: Some(RedisCacheConfig {
                 url: "myredisurl".to_owned(),
-                ttl: 24 * 3600,
+                ttl: 25 * 3600,
                 key_prefix: String::new(),
             }),
             ..Default::default()
@@ -1238,7 +1240,7 @@ fn config_overrides() {
             cache: Some(CacheType::Redis(RedisCacheConfig {
                 url: "myotherredisurl".to_owned(),
                 ttl: 24 * 3600,
-                key_prefix: String::new(),
+                key_prefix: "/redis/prefix".into(),
             }),),
             fallback_cache: DiskCacheConfig {
                 dir: "/env-cache".into(),
