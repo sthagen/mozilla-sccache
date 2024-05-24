@@ -275,7 +275,7 @@ where
                     .map(|f| f.path())
                     .collect()
             })
-            .unwrap_or(Vec::default())
+            .unwrap_or_default()
     }
 }
 
@@ -400,8 +400,9 @@ where
             };
         if let Some(preprocessor_key) = &preprocessor_key {
             if cache_control == CacheControl::Default {
-                if let Some(mut seekable) =
-                    storage.get_preprocessor_cache_entry(preprocessor_key)?
+                if let Some(mut seekable) = storage
+                    .get_preprocessor_cache_entry(preprocessor_key)
+                    .await?
                 {
                     let mut buf = vec![];
                     seekable.read_to_end(&mut buf)?;
@@ -418,10 +419,13 @@ where
                             "Preprocessor cache updated because of time macros: {preprocessor_key}"
                         );
 
-                        if let Err(e) = storage.put_preprocessor_cache_entry(
-                            preprocessor_key,
-                            preprocessor_cache_entry,
-                        ) {
+                        if let Err(e) = storage
+                            .put_preprocessor_cache_entry(
+                                preprocessor_key,
+                                preprocessor_cache_entry,
+                            )
+                            .await
+                        {
                             debug!("Failed to update preprocessor cache: {}", e);
                             update_failed = true;
                         }
@@ -485,16 +489,14 @@ where
             debug!("removing files {:?}", &outputs);
 
             let v: std::result::Result<(), std::io::Error> =
-                outputs.values().fold(Ok(()), |r, output| {
-                    r.and_then(|_| {
-                        let mut path = args_cwd.clone();
-                        path.push(&output.path);
-                        match fs::metadata(&path) {
-                            // File exists, remove it.
-                            Ok(_) => fs::remove_file(&path),
-                            _ => Ok(()),
-                        }
-                    })
+                outputs.values().try_for_each(|output| {
+                    let mut path = args_cwd.clone();
+                    path.push(&output.path);
+                    match fs::metadata(&path) {
+                        // File exists, remove it.
+                        Ok(_) => fs::remove_file(&path),
+                        _ => Ok(()),
+                    }
                 });
             if v.is_err() {
                 warn!("Could not remove files after preprocessing failed!");
@@ -572,6 +574,7 @@ where
 
                 if let Err(e) = storage
                     .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
+                    .await
                 {
                     debug!("Failed to update preprocessor cache: {}", e);
                 }
@@ -624,7 +627,7 @@ const INCBIN_DIRECTIVE: &[u8] = b".incbin";
 fn process_preprocessed_file(
     input_file: &Path,
     cwd: &Path,
-    bytes: &mut Vec<u8>,
+    bytes: &mut [u8],
     included_files: &mut HashMap<PathBuf, String>,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
