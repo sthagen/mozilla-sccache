@@ -86,11 +86,16 @@ impl CCompilerImpl for Nvcc {
         &self,
         arguments: &[OsString],
         cwd: &Path,
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments> {
         let mut arguments = arguments.to_vec();
 
-        if let Ok(flags) = std::env::var("NVCC_PREPEND_FLAGS") {
-            arguments = shlex::split(&flags)
+        if let Some(flags) = env_vars
+            .iter()
+            .find(|(k, _)| k == "NVCC_PREPEND_FLAGS")
+            .and_then(|(_, p)| p.to_str())
+        {
+            arguments = shlex::split(flags)
                 .unwrap_or_default()
                 .iter()
                 .map(|s| s.clone().into_arg_os_string())
@@ -98,9 +103,13 @@ impl CCompilerImpl for Nvcc {
                 .collect::<Vec<_>>();
         }
 
-        if let Ok(flags) = std::env::var("NVCC_APPEND_FLAGS") {
+        if let Some(flags) = env_vars
+            .iter()
+            .find(|(k, _)| k == "NVCC_APPEND_FLAGS")
+            .and_then(|(_, p)| p.to_str())
+        {
             arguments.extend(
-                shlex::split(&flags)
+                shlex::split(flags)
                     .unwrap_or_default()
                     .iter()
                     .map(|s| s.clone().into_arg_os_string()),
@@ -205,7 +214,20 @@ impl CCompilerImpl for Nvcc {
                     .collect::<Vec<_>>(),
             );
             if log_enabled!(Trace) {
-                trace!("dependencies command: {:?}", dependency_cmd);
+                let output_file_name = &parsed_args
+                    .outputs
+                    .get("obj")
+                    .context("Missing object file output")
+                    .unwrap()
+                    .path
+                    .file_name()
+                    .unwrap();
+
+                trace!(
+                    "[{}]: dependencies command: {:?}",
+                    output_file_name.to_string_lossy(),
+                    dependency_cmd
+                );
             }
             dependency_cmd
         };
@@ -223,7 +245,20 @@ impl CCompilerImpl for Nvcc {
                 NvccHostCompiler::Gcc => "-Xcompiler=-P",
             });
             if log_enabled!(Trace) {
-                trace!("preprocessor command: {:?}", preprocess_cmd);
+                let output_file_name = &parsed_args
+                    .outputs
+                    .get("obj")
+                    .context("Missing object file output")
+                    .unwrap()
+                    .path
+                    .file_name()
+                    .unwrap();
+
+                trace!(
+                    "[{}]: preprocessor command: {:?}",
+                    output_file_name.to_string_lossy(),
+                    preprocess_cmd
+                );
             }
             preprocess_cmd
         };
@@ -311,10 +346,15 @@ pub fn generate_compile_commands(
         // Remove all occurrences of `-t=` or `--threads` because it's incompatible with --dryrun
         // Prefer the last occurrence of `-t=` or `--threads` to match nvcc behavior
         loop {
-            if let Some(idx) = unhashed_args.iter().position(|x| x.starts_with("-t=")) {
+            if let Some(idx) = unhashed_args.iter().position(|x| x.starts_with("-t")) {
                 let arg = unhashed_args.get(idx);
                 if let Some(arg) = arg.and_then(|arg| arg.to_str()) {
-                    if let Ok(arg) = arg[3..arg.len()].parse::<usize>() {
+                    let range = if arg.contains('=') {
+                        3..arg.len()
+                    } else {
+                        2..arg.len()
+                    };
+                    if let Ok(arg) = arg[range].parse::<usize>() {
                         num_parallel = arg;
                     }
                 }
@@ -417,6 +457,8 @@ pub fn generate_compile_commands(
         env_vars,
         cwd: cwd.to_owned(),
         host_compiler: host_compiler.clone(),
+        // Only here so we can include it in logs
+        output_file_name: output.file_name().unwrap().to_owned(),
     };
 
     Ok((command, None, Cacheable::Yes))
@@ -432,6 +474,7 @@ pub struct NvccCompileCommand {
     pub env_vars: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,
     pub host_compiler: NvccHostCompiler,
+    pub output_file_name: OsString,
 }
 
 #[async_trait]
@@ -466,6 +509,7 @@ impl CompileCommandImpl for NvccCompileCommand {
             env_vars,
             cwd,
             host_compiler,
+            output_file_name,
         } = self;
 
         let nvcc_subcommand_groups = group_nvcc_subcommands_by_compilation_stage(
@@ -477,6 +521,7 @@ impl CompileCommandImpl for NvccCompileCommand {
             keep_dir.clone(),
             env_vars,
             host_compiler,
+            output_file_name,
         )
         .await?;
 
@@ -528,11 +573,10 @@ impl CompileCommandImpl for NvccCompileCommand {
             nvcc_subcommand_groups[final_assembly_range].chunks(1),
         ] {
             for command_groups in command_group_chunks {
-                let results =
-                    futures::future::join_all(command_groups.iter().map(|commands| {
-                        run_nvcc_subcommands_group(service, creator, cwd, commands)
-                    }))
-                    .await;
+                let results = futures::future::join_all(command_groups.iter().map(|commands| {
+                    run_nvcc_subcommands_group(service, creator, cwd, commands, output_file_name)
+                }))
+                .await;
 
                 for result in results {
                     output = aggregate_output(output, result.unwrap_or_else(error_to_output));
@@ -573,6 +617,7 @@ async fn group_nvcc_subcommands_by_compilation_stage<T>(
     keep_dir: Option<PathBuf>,
     env_vars: &[(OsString, OsString)],
     host_compiler: &NvccHostCompiler,
+    output_file_name: &OsStr,
 ) -> Result<Vec<Vec<NvccGeneratedSubcommand>>>
 where
     T: CommandCreatorSync,
@@ -619,6 +664,7 @@ where
             arguments,
             is_nvcc_exe,
             host_compiler,
+            output_file_name,
         ),
         // Get the host compile command lines with paths relative to `cwd` and absolute paths to `tmp`
         select_nvcc_subcommands(
@@ -630,6 +676,7 @@ where
             &[arguments, &["--keep-dir".into(), tmp.into()][..]].concat(),
             |exe| !is_nvcc_exe(exe),
             host_compiler,
+            output_file_name,
         ),
     )
     .await?;
@@ -655,61 +702,114 @@ where
     // but can optionally be run in parallel to other groups if the user requested via
     // `nvcc --threads`.
 
-    let mut no_more_groups = false;
-    let mut command_groups: Vec<Vec<NvccGeneratedSubcommand>> = vec![];
-
     let preprocessor_flag = match host_compiler {
         NvccHostCompiler::Msvc => "-P",
         _ => "-E",
     }
     .to_owned();
 
-    for (_, dir, exe, args) in all_commands {
-        if log_enabled!(log::Level::Trace) {
-            trace!(
-                "transformed nvcc command: {:?}",
-                [
-                    &[format!("cd {} &&", dir.to_string_lossy()).to_string()],
-                    &[exe.to_str().unwrap_or_default().to_string()][..],
-                    &args[..]
-                ]
-                .concat()
-                .join(" ")
-            );
-        }
+    let gen_module_id_file_flag = "--gen_module_id_file".to_owned();
+    let mut cuda_front_end_group = Vec::<NvccGeneratedSubcommand>::new();
+    let mut final_assembly_group = Vec::<NvccGeneratedSubcommand>::new();
+    let mut device_compile_groups = HashMap::<String, Vec<NvccGeneratedSubcommand>>::new();
 
-        let (env_vars, cacheable) = match exe.file_stem().and_then(|s| s.to_str()) {
+    for (_, dir, exe, args) in all_commands {
+        let mut args = args.clone();
+
+        if let (env_vars, cacheable, Some(group)) = match exe.file_stem().and_then(|s| s.to_str()) {
+            // fatbinary and nvlink are not cacheable
+            Some("fatbinary") | Some("nvlink") => (
+                env_vars.clone(),
+                Cacheable::No,
+                Some(&mut final_assembly_group),
+            ),
             // cicc and ptxas are cacheable
-            Some("cicc") | Some("ptxas") => (env_vars.clone(), Cacheable::Yes),
-            // cudafe++, nvlink, and fatbinary are not cacheable
-            Some("cudafe++") | Some("nvlink") => (env_vars.clone(), Cacheable::No),
-            Some("fatbinary") => {
-                // The fatbinary command represents the start of the last group
-                if !no_more_groups {
-                    command_groups.push(vec![]);
+            Some("cicc") => {
+                let group = device_compile_groups.get_mut(&args[args.len() - 3]);
+                (env_vars.clone(), Cacheable::Yes, group)
+            }
+            Some("ptxas") => {
+                let group = device_compile_groups.values_mut().find(|cmds| {
+                    if let Some(cicc) = cmds.last() {
+                        if let Some(cicc_out) = cicc.args.last() {
+                            return cicc_out == &args[args.len() - 3];
+                        }
+                    }
+                    false
+                });
+                (env_vars.clone(), Cacheable::Yes, group)
+            }
+            // cudafe++ is not cacheable
+            Some("cudafe++") => {
+                // Fix for CTK < 12.0:
+                // Add `--gen_module_id_file` if the cudafe++ args include `--module_id_file_name`
+                if !args.contains(&gen_module_id_file_flag) {
+                    if let Some(idx) = args.iter().position(|x| x == "--module_id_file_name") {
+                        // Insert `--gen_module_id_file` just before `--module_id_file_name` to match nvcc behavior
+                        args.splice(idx..idx, [gen_module_id_file_flag.clone()]);
+                    }
                 }
-                no_more_groups = true;
-                (env_vars.clone(), Cacheable::No)
+                (
+                    env_vars.clone(),
+                    Cacheable::No,
+                    Some(&mut cuda_front_end_group),
+                )
             }
             _ => {
-                // All generated host compiler commands include `-D__CUDA_ARCH_LIST__=`.
-                // If this definition isn't present, this command is either a new binary
+                // All generated host compiler commands include one of these defines.
+                // If one of these isn't present, this command is either a new binary
                 // in the CTK that we don't know about, or a line like `rm x_dlink.reg.c`
                 // that nvcc generates in certain cases.
-                if !args
-                    .iter()
-                    .any(|arg| arg.starts_with("-D__CUDA_ARCH_LIST__"))
-                {
+                if !args.iter().any(|arg| {
+                    arg.starts_with("-D__CUDACC__")
+                        || arg.starts_with("-D__NVCC__")
+                        || arg.starts_with("-D__CUDA_ARCH__")
+                        || arg.starts_with("-D__CUDA_ARCH_LIST__")
+                }) {
                     continue;
                 }
                 if args.contains(&preprocessor_flag) {
-                    // Each preprocessor step represents the start of a new command
-                    // group, unless it comes after a call to fatbinary.
-                    if !no_more_groups {
-                        command_groups.push(vec![]);
+                    // Each preprocessor step represents the start of a new command group
+                    if let Some(out_file) = if cfg!(target_os = "windows") {
+                        args.iter()
+                            .find(|x| x.starts_with("-Fi"))
+                            .and_then(|x| x.strip_prefix("-Fi"))
+                    } else {
+                        args.iter()
+                            .position(|x| x == "-o")
+                            .and_then(|i| args.get(i + 1).map(|o| o.as_str()))
                     }
-                    // Do not run preprocessor calls through sccache
-                    (env_vars.clone(), Cacheable::No)
+                    .map(PathBuf::from)
+                    .and_then(|out_path| {
+                        out_path
+                            .file_name()
+                            .and_then(|out_name| out_name.to_str())
+                            .map(|out_name| out_name.to_owned())
+                    })
+                    .and_then(|out_name| {
+                        // If the output file ends with...
+                        // * .cpp1.ii - cicc/ptxas input
+                        // * .cpp4.ii - cudafe++ input
+                        if out_name.ends_with(".cpp1.ii") {
+                            Some(out_name.to_owned())
+                        } else {
+                            None
+                        }
+                    }) {
+                        let new_device_compile_group = vec![];
+                        device_compile_groups.insert(out_file.clone(), new_device_compile_group);
+                        (
+                            env_vars.clone(),
+                            Cacheable::No,
+                            device_compile_groups.get_mut(&out_file),
+                        )
+                    } else {
+                        (
+                            env_vars.clone(),
+                            Cacheable::No,
+                            Some(&mut cuda_front_end_group),
+                        )
+                    }
                 } else {
                     // Returns Cacheable::Yes to indicate we _do_ want to run this host
                     // compiler call through sccache (because it may be distributed),
@@ -730,30 +830,40 @@ where
                             .cloned()
                             .collect::<Vec<_>>(),
                         Cacheable::Yes,
+                        Some(&mut final_assembly_group),
                     )
                 }
             }
-        };
-
-        // Initialize the first group in case the first command isn't a call to the host preprocessor,
-        // i.e. `nvcc -o test.o -c test.c`
-        if command_groups.is_empty() {
-            command_groups.push(vec![]);
-        }
-
-        match command_groups.last_mut() {
-            None => {}
-            Some(group) => {
-                group.push(NvccGeneratedSubcommand {
-                    exe: exe.clone(),
-                    args: args.clone(),
-                    cwd: dir.into(),
-                    env_vars,
-                    cacheable,
-                });
+        } {
+            if log_enabled!(log::Level::Trace) {
+                trace!(
+                    "[{}]: transformed nvcc command: \"{}\"",
+                    output_file_name.to_string_lossy(),
+                    [
+                        &[format!("cd {} &&", dir.to_string_lossy()).to_string()],
+                        &[exe.to_str().unwrap_or_default().to_string()][..],
+                        &args[..]
+                    ]
+                    .concat()
+                    .join(" ")
+                );
             }
-        };
+
+            group.push(NvccGeneratedSubcommand {
+                exe: exe.clone(),
+                args: args.clone(),
+                cwd: dir.into(),
+                env_vars,
+                cacheable,
+            });
+        }
     }
+
+    let mut command_groups = vec![];
+
+    command_groups.push(cuda_front_end_group);
+    command_groups.extend(device_compile_groups.into_values());
+    command_groups.push(final_assembly_group);
 
     Ok(command_groups)
 }
@@ -768,6 +878,7 @@ async fn select_nvcc_subcommands<T, F>(
     arguments: &[OsString],
     select_subcommand: F,
     host_compiler: &NvccHostCompiler,
+    output_file_name: &OsStr,
 ) -> Result<Vec<(usize, PathBuf, Vec<String>)>>
 where
     F: Fn(&str) -> bool,
@@ -775,7 +886,8 @@ where
 {
     if log_enabled!(log::Level::Trace) {
         trace!(
-            "nvcc dryrun command: {:?}",
+            "[{}]: nvcc dryrun command: {:?}",
+            output_file_name.to_string_lossy(),
             [
                 &[executable.to_str().unwrap_or_default().to_string()][..],
                 &dist::osstrings_to_strings(arguments).unwrap_or_default()[..],
@@ -920,7 +1032,8 @@ fn fold_env_vars_or_split_into_exe_and_args(
         let line = line
             .replace("\"\"", "\"")
             .replace(r"\\?\", "")
-            .replace('\\', "/");
+            .replace('\\', "/")
+            .replace(r"//?/", "");
         match host_compiler {
             NvccHostCompiler::Msvc => line.replace(" -E ", " -P ").replace(" > ", " -Fi"),
             _ => line,
@@ -1007,19 +1120,22 @@ fn remap_generated_filenames(
                         .entry(arg)
                         .or_insert_with_key(|arg| {
                             // Initialize or update the number of files with a given extension:
-                            // compute_70.cudafe1.stub.c -> 0.cudafe1.stub.c
-                            // compute_60.cudafe1.stub.c -> 1.cudafe1.stub.c
+                            // compute_70.cudafe1.stub.c -> x_0.cudafe1.stub.c
+                            // compute_60.cudafe1.stub.c -> x_1.cudafe1.stub.c
                             // etc.
                             let count = ext_counts
                                 .entry(extension.into())
                                 .and_modify(|c| *c += 1)
                                 .or_insert(0)
                                 .to_string();
-                            // Return `/tmp/dir/{count}.{ext}` as the new name, i.e. `/tmp/dir/0.cudafe1.stub.c`
+                            // Return `/tmp/dir/x_{count}.{ext}` as the new name, i.e. `/tmp/dir/x_0.cudafe1.stub.c`
                             PathBuf::from(arg)
                                 .parent()
                                 .unwrap_or(Path::new(""))
-                                .join(count + extension)
+                                // Don't use the count as the first character of the file name, because the file name
+                                // may be used as an identifier (via the __FILE__ macro) and identifiers with leading
+                                // digits are not valid in C/C++, i.e. `x_0.cudafe1.cpp` instead of `0.cudafe1.cpp`.
+                                .join("x_".to_owned() + &count + extension)
                                 .to_string_lossy()
                                 .to_string()
                         })
@@ -1029,8 +1145,22 @@ fn remap_generated_filenames(
                     // If the argument isn't a file name with one of our extensions,
                     // it may _reference_ files we've renamed. Go through and replace
                     // all old names with their new stable names.
+                    //
+                    // Sort by string length descending so we don't accidentally replace
+                    // `zzz.cudafe1.cpp` with the new name for `zzz.cudafe1.c`.
+                    //
+                    // For example, if we have these renames:
+                    //
+                    //   compute_70.cudafe1.cpp -> x_0.cudafe1.cpp
+                    //   compute_70.cudafe1.c   -> x_2.cudafe1.c
+                    //
+                    // `compute_70.cudafe1.cpp` should be replaced with `x_0.cudafe1.cpp`, not `x_2.cudafe1.c`
+                    //
                     let mut arg = arg.clone();
-                    for (old, new) in old_to_new.iter() {
+                    for (old, new) in old_to_new
+                        .iter()
+                        .sorted_by(|a, b| b.0.len().cmp(&a.0.len()))
+                    {
                         arg = arg.replace(old, new);
                     }
                     arg
@@ -1051,6 +1181,7 @@ async fn run_nvcc_subcommands_group<T>(
     creator: &T,
     cwd: &Path,
     commands: &[NvccGeneratedSubcommand],
+    output_file_name: &OsStr,
 ) -> Result<process::Output>
 where
     T: CommandCreatorSync,
@@ -1072,13 +1203,12 @@ where
 
         if log_enabled!(log::Level::Trace) {
             trace!(
-                "run_commands_sequential cwd={:?}, cmd={:?}",
+                "[{}]: run_commands_sequential cwd={:?}, cmd=\"{}\"",
+                output_file_name.to_string_lossy(),
                 cwd,
                 [
                     vec![exe.clone().into_os_string().into_string().unwrap()],
-                    args.iter()
-                        .map(|x| shlex::try_quote(x).unwrap().to_string())
-                        .collect::<Vec<_>>()
+                    args.to_vec()
                 ]
                 .concat()
                 .join(" ")
@@ -1218,6 +1348,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("--compiler-bindir", OsString, CanBeSeparated('='), PassThrough),
     take_arg!("--compiler-options", OsString, CanBeSeparated('='), PreprocessorArgument),
     flag!("--cubin", DoCompilation),
+    take_arg!("--default-stream", OsString, CanBeSeparated('='), PassThrough),
     flag!("--device-c", DoCompilation),
     flag!("--device-w", DoCompilation),
     flag!("--expt-extended-lambda", PreprocessorArgumentFlag),
@@ -1257,6 +1388,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-code", OsString, CanBeSeparated('='), PassThrough),
     flag!("-cubin", DoCompilation),
     flag!("-dc", DoCompilation),
+    take_arg!("-default-stream", OsString, CanBeSeparated('='), PassThrough),
     flag!("-dw", DoCompilation),
     flag!("-expt-extended-lambda", PreprocessorArgumentFlag),
     flag!("-expt-relaxed-constexpr", PreprocessorArgumentFlag),
@@ -1272,7 +1404,8 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     flag!("-ptx", DoCompilation),
     take_arg!("-rdc", OsString, CanBeSeparated('='), PreprocessorArgument),
     flag!("-save-temps", UnhashedFlag),
-    take_arg!("-t", OsString, CanBeSeparated('='), Unhashed),
+    take_arg!("-t", OsString, CanBeSeparated, Unhashed),
+    take_arg!("-t=", OsString, Concatenated, Unhashed),
     take_arg!("-x", OsString, CanBeSeparated('='), Language),
 ]);
 
@@ -1293,7 +1426,7 @@ mod test {
             host_compiler_version: None,
             version: None,
         }
-        .parse_arguments(&arguments, ".".as_ref())
+        .parse_arguments(&arguments, ".".as_ref(), &[])
     }
     fn parse_arguments_msvc(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -1302,7 +1435,7 @@ mod test {
             host_compiler_version: None,
             version: None,
         }
-        .parse_arguments(&arguments, ".".as_ref())
+        .parse_arguments(&arguments, ".".as_ref(), &[])
     }
     fn parse_arguments_nvc(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -1311,7 +1444,7 @@ mod test {
             host_compiler_version: None,
             version: None,
         }
-        .parse_arguments(&arguments, ".".as_ref())
+        .parse_arguments(&arguments, ".".as_ref(), &[])
     }
 
     macro_rules! parses {
@@ -1455,9 +1588,10 @@ mod test {
     #[test]
     fn test_parse_threads_argument_simple_cu() {
         let a = parses!(
-            "-t=1",
+            "-t1",
+            "-t=2",
             "-t",
-            "2",
+            "3",
             "--threads=1",
             "--threads=2",
             "-c",
@@ -1479,7 +1613,7 @@ mod test {
         );
         assert!(a.preprocessor_args.is_empty());
         assert_eq!(
-            ovec!["-t=1", "-t=2", "--threads", "1", "--threads", "2"],
+            ovec!["-t1", "-t=2", "-t3", "--threads", "1", "--threads", "2"],
             a.unhashed_args
         );
     }

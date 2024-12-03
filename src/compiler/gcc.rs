@@ -27,7 +27,7 @@ use fs_err as fs;
 use log::Level::Trace;
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -56,6 +56,7 @@ impl CCompilerImpl for Gcc {
         &self,
         arguments: &[OsString],
         cwd: &Path,
+        _env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments> {
         parse_arguments(arguments, cwd, &ARGS[..], self.gplusplus, self.kind())
     }
@@ -856,8 +857,6 @@ where
         let _ = rewrite_includes_only;
     }
 
-    trace!("compile");
-
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
         None => return Err(anyhow!("Missing object file output")),
@@ -884,6 +883,17 @@ where
         arguments.push("--".into());
     }
     arguments.push(parsed_args.input.clone().into());
+
+    trace!(
+        "compile: {} {}",
+        executable.to_string_lossy(),
+        arguments.join(OsStr::new(" ")).to_string_lossy()
+    );
+
+    #[cfg(feature = "dist-client")]
+    let has_verbose_flag = arguments.contains(&OsString::from("-v"))
+        || arguments.contains(&OsString::from("--verbose"));
+
     let command = SingleCompileCommand {
         executable: executable.to_owned(),
         arguments,
@@ -894,56 +904,64 @@ where
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
     #[cfg(feature = "dist-client")]
-    let dist_command = (|| {
-        // https://gcc.gnu.org/onlinedocs/gcc-4.9.0/gcc/Overall-Options.html
-        let mut language: Option<String> =
-            language_to_arg(parsed_args.language).map(|lang| lang.into());
-        if !rewrite_includes_only {
-            match parsed_args.language {
-                Language::C => language = Some("cpp-output".into()),
-                Language::GenericHeader | Language::CHeader | Language::CxxHeader => {}
-                _ => language.as_mut()?.push_str("-cpp-output"),
+    // 1. Compilations with -v|--verbose must be run locally, since the verbose
+    //    output is parsed by tools like CMake and must reflect the local toolchain
+    // 2. ClangCUDA cannot be dist-compiled because Clang has separate host and
+    //    device preprocessor outputs and cannot compile preprocessed CUDA files.
+    let dist_command = if has_verbose_flag || parsed_args.language == Language::Cuda {
+        None
+    } else {
+        (|| {
+            // https://gcc.gnu.org/onlinedocs/gcc-4.9.0/gcc/Overall-Options.html
+            let mut language: Option<String> =
+                language_to_arg(parsed_args.language).map(|lang| lang.into());
+            if !rewrite_includes_only {
+                match parsed_args.language {
+                    Language::C => language = Some("cpp-output".into()),
+                    Language::GenericHeader | Language::CHeader | Language::CxxHeader => {}
+                    _ => language.as_mut()?.push_str("-cpp-output"),
+                }
             }
-        }
 
-        let mut arguments: Vec<String> = vec![];
-        // Language needs to be before input
-        if let Some(lang) = &language {
-            arguments.extend(vec!["-x".into(), lang.into()])
-        }
-        arguments.extend(vec![
-            parsed_args.compilation_flag.clone().into_string().ok()?,
-            path_transformer.as_dist(&parsed_args.input)?,
-            "-o".into(),
-            path_transformer.as_dist(out_file)?,
-        ]);
-        if let CCompilerKind::Gcc = kind {
-            // From https://gcc.gnu.org/onlinedocs/gcc/Preprocessor-Options.html:
-            //
-            // -fdirectives-only
-            //
-            //     [...]
-            //
-            //     With -fpreprocessed, predefinition of command line and most
-            //     builtin macros is disabled. Macros such as __LINE__, which
-            //     are contextually dependent, are handled normally. This
-            //     enables compilation of files previously preprocessed with -E
-            //     -fdirectives-only.
-            //
-            // Which is exactly what we do :-)
-            if rewrite_includes_only && !parsed_args.suppress_rewrite_includes_only {
-                arguments.push("-fdirectives-only".into());
+            let mut arguments: Vec<String> = vec![];
+            // Language needs to be before input
+            if let Some(lang) = &language {
+                arguments.extend(vec!["-x".into(), lang.into()])
             }
-            arguments.push("-fpreprocessed".into());
-        }
-        arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
-        Some(dist::CompileCommand {
-            executable: path_transformer.as_dist(executable)?,
-            arguments,
-            env_vars: dist::osstring_tuples_to_strings(env_vars)?,
-            cwd: path_transformer.as_dist_abs(cwd)?,
-        })
-    })();
+            arguments.extend(vec![
+                parsed_args.compilation_flag.clone().into_string().ok()?,
+                path_transformer.as_dist(&parsed_args.input)?,
+                "-o".into(),
+                path_transformer.as_dist(out_file)?,
+            ]);
+            if let CCompilerKind::Gcc = kind {
+                // From https://gcc.gnu.org/onlinedocs/gcc/Preprocessor-Options.html:
+                //
+                // -fdirectives-only
+                //
+                //     [...]
+                //
+                //     With -fpreprocessed, predefinition of command line and most
+                //     builtin macros is disabled. Macros such as __LINE__, which
+                //     are contextually dependent, are handled normally. This
+                //     enables compilation of files previously preprocessed with -E
+                //     -fdirectives-only.
+                //
+                // Which is exactly what we do :-)
+                if rewrite_includes_only && !parsed_args.suppress_rewrite_includes_only {
+                    arguments.push("-fdirectives-only".into());
+                }
+                arguments.push("-fpreprocessed".into());
+            }
+            arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+            Some(dist::CompileCommand {
+                executable: path_transformer.as_dist(executable)?,
+                arguments,
+                env_vars: dist::osstring_tuples_to_strings(env_vars)?,
+                cwd: path_transformer.as_dist_abs(cwd)?,
+            })
+        })()
+    };
 
     Ok((command, dist_command, Cacheable::Yes))
 }
@@ -2202,6 +2220,124 @@ mod test {
         #[cfg(feature = "dist-client")]
         assert!(dist_command.is_some());
         #[cfg(not(feature = "dist-client"))]
+        assert!(dist_command.is_none());
+        let _ = command.execute(&service, &creator).wait();
+        assert_eq!(Cacheable::Yes, cacheable);
+        // Ensure that we ran all processes.
+        assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_compile_simple_verbose_short() {
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            input: "foo.c".into(),
+            double_dash_input: false,
+            language: Language::C,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec!["-v".into()],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let runtime = single_threaded_runtime();
+        let storage = MockStorage::new(None, false);
+        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let compiler = &f.bins[0];
+        // Compiler invocation.
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+        let mut path_transformer = dist::PathTransformer::new();
+        let (command, dist_command, cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            compiler,
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            false,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        // -v should never generate a dist_command
+        assert!(dist_command.is_none());
+        let _ = command.execute(&service, &creator).wait();
+        assert_eq!(Cacheable::Yes, cacheable);
+        // Ensure that we ran all processes.
+        assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_compile_simple_verbose_long() {
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            input: "foo.c".into(),
+            double_dash_input: false,
+            language: Language::C,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec!["--verbose".into()],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let runtime = single_threaded_runtime();
+        let storage = MockStorage::new(None, false);
+        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let compiler = &f.bins[0];
+        // Compiler invocation.
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+        let mut path_transformer = dist::PathTransformer::new();
+        let (command, dist_command, cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            compiler,
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            false,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        // --verbose should never generate a dist_command
         assert!(dist_command.is_none());
         let _ = command.execute(&service, &creator).wait();
         assert_eq!(Cacheable::Yes, cacheable);

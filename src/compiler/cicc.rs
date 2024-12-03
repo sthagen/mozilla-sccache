@@ -56,6 +56,7 @@ impl CCompilerImpl for Cicc {
         &self,
         arguments: &[OsString],
         cwd: &Path,
+        _env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments> {
         parse_arguments(arguments, cwd, Language::Ptx, &ARGS[..])
     }
@@ -116,11 +117,11 @@ where
     let mut take_next = false;
     let mut outputs = HashMap::new();
     let mut extra_dist_files = vec![];
+    let mut gen_module_id_file = false;
+    let mut module_id_file_name = Option::<PathBuf>::None;
 
     let mut common_args = vec![];
     let mut unhashed_args = vec![];
-    let mut gen_module_id_file = false;
-    let mut module_id_file_name = Option::<PathBuf>::None;
 
     for arg in ArgsIter::new(args.iter().cloned(), arg_info) {
         match arg {
@@ -279,6 +280,21 @@ pub fn generate_compile_commands(
         out_file.into(),
     ]);
 
+    if log_enabled!(log::Level::Trace) {
+        trace!(
+            "[{}]: {} command: {:?}",
+            out_file.file_name().unwrap().to_string_lossy(),
+            executable.file_name().unwrap().to_string_lossy(),
+            [
+                &[format!("cd {} &&", cwd.to_string_lossy()).to_string()],
+                &[executable.to_str().unwrap_or_default().to_string()][..],
+                &dist::osstrings_to_strings(&arguments).unwrap_or_default()[..]
+            ]
+            .concat()
+            .join(" ")
+        );
+    }
+
     let command = SingleCompileCommand {
         executable: executable.to_owned(),
         arguments,
@@ -311,11 +327,11 @@ pub fn generate_compile_commands(
 
 ArgData! { pub
     Output(PathBuf),
-    UnhashedOutput(PathBuf),
+    PassThrough(OsString),
     UnhashedFlag,
     UnhashedGenModuleIdFileFlag,
     UnhashedModuleIdFileName(PathBuf),
-    PassThrough(OsString),
+    UnhashedOutput(PathBuf),
 }
 
 use self::ArgData::*;
