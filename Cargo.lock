@@ -2517,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "sccache"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "ar",
@@ -2544,7 +2544,6 @@ dependencies = [
  "http-body-util",
  "hyper 1.1.0",
  "hyper-util",
- "is-terminal",
  "itertools",
  "jobserver",
  "jsonwebtoken",
