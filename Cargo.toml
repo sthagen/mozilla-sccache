@@ -18,6 +18,9 @@ name = "sccache"
 name = "sccache-dist"
 required-features = ["dist-server"]
 
+[profile.test]
+debug = false # save disk space
+
 [profile.release]
 codegen-units = 1
 lto = true
@@ -44,7 +47,7 @@ filetime = "0.2"
 flate2 = { version = "1.0", optional = true, default-features = false, features = [
   "rust_backend",
 ] }
-fs-err = "2.11"
+fs-err = "3"
 futures = "0.3"
 gzp = { version = "0.11.3", default-features = false, features = [
   "deflate_rust",
@@ -68,7 +71,7 @@ mime = "0.3"
 number_prefix = "0.4"
 object = "0.37"
 opendal = { version = "0.54.0", optional = true, default-features = false }
-openssl = { version = "0.10.72", optional = true }
+openssl = { version = "0.10.75", optional = true }
 rand = "0.8.4"
 regex = "1.10.3"
 reqsign = { version = "0.18.0", optional = true }
@@ -134,7 +137,7 @@ test-case = "3.3.1"
 thirtyfour_sync = "0.27"
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5"
+daemonix = "0.1"
 
 [target.'cfg(not(target_os = "freebsd"))'.dependencies.libmount]
 optional = true
