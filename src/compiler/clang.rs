@@ -243,6 +243,8 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-mllvm", OsString, Separated, PassThrough),
     flag!("-mrelax-all", PassThroughFlag),
     flag!("-no-opaque-pointers", PreprocessorArgumentFlag),
+    // Note: this is ROCm clang specific. Parallelism level shouldn't affect output.
+    take_arg!("-parallel-jobs", OsString, Concatenated(b'='), Unhashed),
     take_arg!("-plugin-arg", OsString, Concatenated(b'-'), PassThrough),
     take_arg!("-target", OsString, Separated, PassThrough),
     flag!("-verify", PreprocessorArgumentFlag),
@@ -594,6 +596,28 @@ mod test {
             ],
             b.common_args
         );
+    }
+
+    #[test]
+    fn test_parse_arguments_hip_unhash_parallel_jobs() {
+        let a = parses!(
+            "-c",
+            "foo.cpp",
+            "-x",
+            "hip",
+            "--offload-arch=gfx900",
+            "-parallel-jobs=5",
+            "-o",
+            "foo.o",
+            "--hip-path=/usr"
+        );
+        assert_eq!(Language::Hip, a.language);
+        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(
+            ovec!["--offload-arch=gfx900", "--hip-path=/usr"],
+            a.common_args
+        );
+        assert_eq!(ovec!["-parallel-jobs=5"], a.unhashed_args,);
     }
 
     #[test]
@@ -957,6 +981,17 @@ mod test {
     #[test]
     fn test_parse_fplugin() {
         let a = parses!("-c", "foo.c", "-o", "foo.o", "-fplugin", "plugin.so");
+        println!("A {:#?}", a);
+        assert_eq!(ovec!["-fplugin", "plugin.so"], a.common_args);
+        assert_eq!(
+            ovec![std::env::current_dir().unwrap().join("plugin.so")],
+            a.extra_hash_files
+        );
+    }
+
+    #[test]
+    fn test_parse_fplugin_concatenated() {
+        let a = parses!("-c", "foo.c", "-o", "foo.o", "-fplugin=plugin.so");
         println!("A {:#?}", a);
         assert_eq!(ovec!["-fplugin", "plugin.so"], a.common_args);
         assert_eq!(
