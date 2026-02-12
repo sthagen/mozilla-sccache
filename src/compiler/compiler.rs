@@ -1882,7 +1882,8 @@ where
 mod test {
     use super::*;
     use crate::cache::disk::DiskCache;
-    use crate::cache::{CacheMode, CacheRead, PreprocessorCacheModeConfig};
+    use crate::cache::{CacheMode, CacheRead};
+    use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
@@ -1952,7 +1953,7 @@ mod test {
                     !lang.is_c_like_header(),
                     "{:?} should not be processed, but it is a C-like header and can be used as preprocessor input",
                     lang
-                )
+                );
             }
         }
     }
