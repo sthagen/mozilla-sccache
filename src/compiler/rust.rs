@@ -50,7 +50,7 @@ use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
 use std::io;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -585,10 +585,7 @@ where
                 .context("Failed to parse output of rustup which rustc")?;
 
             let proxied_compiler = PathBuf::from(stdout.trim());
-            trace!(
-                "proxy: rustup which rustc produced: {:?}",
-                &proxied_compiler
-            );
+            trace!("proxy: rustup which rustc produced: {:?}", proxied_compiler);
             // TODO: Delegate FS access to a thread pool if possible
             let attr = fs::metadata(proxied_compiler.as_path())
                 .context("Failed to obtain metadata of the resolved, true rustc")?;
@@ -725,7 +722,7 @@ impl RustupProxy {
                 let stdout = String::from_utf8(rustup_candidate_check.stdout)
                     .map_err(|_e| anyhow!("Response of `rustup --version` is not valid UTF-8"))?;
                 Ok(if stdout.trim().starts_with("rustup ") {
-                    trace!("PROXY rustup --version produced: {}", &stdout);
+                    trace!("PROXY rustup --version produced: {}", stdout);
                     Self::new(&proxy_executable).map(Some)
                 } else {
                     Err(anyhow!("Unexpected output or `rustup --version`"))
@@ -1065,6 +1062,61 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-o", PathBuf, CanBeSeparated, TooHardPath),
 ]);
 
+/// Split the contents of a rustc `@response` file into arguments.
+///
+/// rustc reads response files by splitting on newlines, trimming whitespace,
+/// and skipping empty lines.  It does not support quoting or backslash escaping
+/// (unlike GCC), and does not recursively expand `@file` directives found
+/// inside a response file.
+///
+/// Rustc reference: https://github.com/rust-lang/rust/blob/main/compiler/rustc_driver_impl/src/args.rs
+fn split_rust_response_file_args(contents: &str) -> Vec<OsString> {
+    contents
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(OsString::from)
+        .collect()
+}
+
+pub struct ExpandResponseFile<'a> {
+    cwd: &'a Path,
+    stack: Vec<OsString>,
+}
+
+impl<'a> ExpandResponseFile<'a> {
+    pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
+        ExpandResponseFile {
+            stack: args.iter().rev().map(|a| a.to_owned()).collect(),
+            cwd,
+        }
+    }
+}
+
+impl Iterator for ExpandResponseFile<'_> {
+    type Item = OsString;
+
+    fn next(&mut self) -> Option<OsString> {
+        loop {
+            let arg = self.stack.pop()?;
+            let file = match arg.split_prefix("@") {
+                Some(arg) => self.cwd.join(arg),
+                None => return Some(arg),
+            };
+
+            let mut contents = String::new();
+            let res = fs_err::File::open(&file)
+                .and_then(|f| BufReader::new(f).read_to_string(&mut contents));
+            if let Err(e) = res {
+                debug!("failed to read @-file `{}`: {}", file.display(), e);
+                return Some(arg);
+            }
+            let new_args = split_rust_response_file_args(&contents);
+            self.stack.extend(new_args.into_iter().rev());
+        }
+    }
+}
+
 fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
@@ -1087,7 +1139,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut gcno = false;
     let mut target_json = None;
 
-    for (idx, arg) in ArgsIter::new(arguments.iter().cloned(), &ARGS[..]).enumerate() {
+    // Custom iterator to expand `@` arguments which stand for reading a file
+    // and interpreting it as a list of more arguments.
+    let it = ExpandResponseFile::new(cwd, arguments);
+
+    for (idx, arg) in ArgsIter::new(it, &ARGS[..]).enumerate() {
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
             Some(TooHardFlag) | Some(TooHardPath(_)) => {
@@ -1179,14 +1235,13 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             None => {
                 match arg {
                     Argument::Raw(ref val) => {
-                        if idx == 0 {
-                            if let Some(value) = val.to_str() {
-                                if value == "rustc" {
-                                    // If the first argument is rustc, it's likely called via clippy-driver,
-                                    // so it's not actually an input file, which means we should discount it.
-                                    continue;
-                                }
-                            }
+                        if idx == 0
+                            && let Some(value) = val.to_str()
+                            && value == "rustc"
+                        {
+                            // If the first argument is rustc, it's likely called via clippy-driver,
+                            // so it's not actually an input file, which means we should discount it.
+                            continue;
                         }
                         if input.is_some() {
                             // Can't cache compilations with multiple inputs.
@@ -1814,10 +1869,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
             // OUT_DIR was changed during transformation, check if this compilation is relying on anything
             // inside it - if so, disallow distributed compilation (there are sometimes hardcoded paths present)
-            if let Some(out_dir) = changed_out_dir {
-                if self.inputs.iter().any(|input| input.starts_with(&out_dir)) {
-                    return None;
-                }
+            if let Some(out_dir) = changed_out_dir
+                && self.inputs.iter().any(|input| input.starts_with(&out_dir))
+            {
+                return None;
             }
 
             // Add any necessary path transforms - although we haven't packaged up inputs yet, we've
@@ -1833,7 +1888,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 if remapped_disks.contains(&dist_path) {
                     continue;
                 }
-                dist_arguments.push(format!("--remap-path-prefix={}={}", &dist_path, local_path));
+                dist_arguments.push(format!("--remap-path-prefix={}={}", dist_path, local_path));
                 remapped_disks.insert(dist_path);
             }
 
@@ -2044,18 +2099,17 @@ impl pkg::InputsPackager for RustInputsPackager {
                         "Cannot distribute dylib input {} on this platform",
                         input_path.display()
                     )
-                } else if ext == RLIB_EXTENSION || ext == RMETA_EXTENSION {
-                    if let Some((ref rlib_dep_reader, ref mut dep_crate_names)) =
+                } else if (ext == RLIB_EXTENSION || ext == RMETA_EXTENSION)
+                    && let Some((ref rlib_dep_reader, ref mut dep_crate_names)) =
                         rlib_dep_reader_and_names
-                    {
-                        dep_crate_names.extend(
-                            rlib_dep_reader
-                                .discover_rlib_deps(&env_vars, &input_path)
-                                .with_context(|| {
-                                    format!("Failed to read deps of {}", input_path.display())
-                                })?,
-                        );
-                    }
+                {
+                    dep_crate_names.extend(
+                        rlib_dep_reader
+                            .discover_rlib_deps(&env_vars, &input_path)
+                            .with_context(|| {
+                                format!("Failed to read deps of {}", input_path.display())
+                            })?,
+                    );
                 }
             }
 
@@ -2078,10 +2132,10 @@ impl pkg::InputsPackager for RustInputsPackager {
             tar_inputs.push((input_path, dist_input_path));
         }
 
-        if log_enabled!(Trace) {
-            if let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names {
-                trace!("Identified dependency crate names: {:?}", dep_crate_names);
-            }
+        if log_enabled!(Trace)
+            && let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names
+        {
+            trace!("Identified dependency crate names: {:?}", dep_crate_names);
         }
 
         // Given the link paths, find the things we need to send over the wire to the remote machine. If
@@ -2350,7 +2404,7 @@ src/bin/sccache-dist/token_check.rs:
         dep_info: Some(depinfo_file.clone()),
     });
     let () = ror
-        .handle_outputs(&pt, &[depinfo_file.clone()], &[])
+        .handle_outputs(&pt, std::slice::from_ref(&depinfo_file), &[])
         .unwrap();
 
     let mut s = String::new();
@@ -2527,10 +2581,10 @@ impl RlibDepReader {
 
         {
             let mut cache = self.cache.lock().unwrap();
-            if let Some(deps_detail) = cache.get(rlib) {
-                if rlib_mtime == deps_detail.mtime {
-                    return Ok(deps_detail.deps.clone());
-                }
+            if let Some(deps_detail) = cache.get(rlib)
+                && rlib_mtime == deps_detail.mtime
+            {
+                return Ok(deps_detail.deps.clone());
             }
         }
 
@@ -3983,5 +4037,65 @@ proc_macro false
             ArgDisposition::Separated
         )));
         assert_eq!(h.target_json, Some(PathBuf::from("/path/to/target.json")));
+    }
+
+    #[test]
+    fn test_split_rust_response_file_args() {
+        // Simple one arg per line.
+        assert_eq!(
+            ovec!["--emit", "link", "foo.rs"],
+            split_rust_response_file_args("--emit\nlink\nfoo.rs\n")
+        );
+        // Lines are trimmed.
+        assert_eq!(
+            ovec!["--emit", "link", "foo.rs"],
+            split_rust_response_file_args("  --emit  \n\tlink\n  foo.rs\n")
+        );
+        // Empty lines are skipped.
+        assert_eq!(
+            ovec!["--emit", "foo.rs"],
+            split_rust_response_file_args("--emit\n\n\nfoo.rs\n")
+        );
+        // Empty input.
+        assert!(split_rust_response_file_args("").is_empty());
+        assert!(split_rust_response_file_args("\n\n  \n\t\n").is_empty());
+        // Carriage returns are trimmed.
+        assert_eq!(
+            ovec!["--emit", "foo.rs"],
+            split_rust_response_file_args("--emit\r\nfoo.rs\r\n")
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_response_file() {
+        let td = tempfile::Builder::new()
+            .prefix("sccache")
+            .tempdir()
+            .unwrap();
+        File::create(td.path().join("args"))
+            .unwrap()
+            .write_all(b"--emit\nlink,dep-info\nfoo.rs\n--out-dir\nout\n--crate-name\nfoo\n--crate-type\nlib\n")
+            .unwrap();
+        let arg = format!("@{}", td.path().join("args").display());
+        let args: Vec<OsString> = vec![OsString::from(arg)];
+        let result = parse_arguments(&args, td.path());
+        let parsed = match result {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(parsed.output_dir.to_str(), Some("out"));
+        assert!(parsed.dep_info.is_some());
+        assert!(parsed.externs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_arguments_response_file_missing() {
+        // When the @file cannot be read, the raw @-arg passes through.
+        // Without other required flags it becomes the input file, leading
+        // to missing --out-dir / --emit etc.
+        let cwd = Path::new("/nonexistent");
+        let args: Vec<OsString> = vec![OsString::from("@missing_file")];
+        let result = parse_arguments(&args, cwd);
+        assert!(matches!(result, CompilerArguments::CannotCache(..)));
     }
 }
